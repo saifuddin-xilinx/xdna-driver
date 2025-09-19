@@ -7,7 +7,9 @@
 #define _VE2_MGMT_H_
 
 #include <linux/xlnx-ai-engine.h>
+#include <linux/version.h>
 
+struct aie_device;
 struct amdxdna_dev;
 struct amdxdna_ctx;
 
@@ -28,6 +30,8 @@ struct amdxdna_ctx;
 #define VE2_CORE_TILE_MEMORY_OFF	0x0
 #define HSA_QUEUE_READ_INDEX_OFFSET	0x0
 #define HSA_QUEUE_WRITE_INDEX_OFFSET	0x10
+#define HSA_QUEUE_NOT_EMPTY		1
+#define CERT_IS_IDLE			4
 
 #define SHIM_DATA_MEMORY_OFF(col, row, off) \
 	VE2_ADDR(col, row, VE2_SHIM_DATA_MEMORY_OFF + (off))
@@ -41,9 +45,100 @@ struct amdxdna_ctx;
 #define CORE_TILE_MEMORY_OFF(col, row, off) \
 	VE2_ADDR(col, row, VE2_CORE_TILE_MEMORY_OFF + (off))
 
+typedef struct {
+        u32 fw_state;
+        u32 abs_page_index;
+        u32 ppc;
+} misc_info_t;
+
+// Read from handshake memory
+static inline int
+ve2_partition_read_privileged_mem(struct device *aie_dev, u32 lead_col, u32 col,
+		size_t field_offset, size_t size, void *p_read_mem)
+{
+        u32 offset;
+
+#if KERNEL_VERSION(6, 10, 0) > LINUX_VERSION_CODE
+        col = col + lead_col;
+#endif
+
+        offset = CERT_HANDSHAKE_OFF(col) + field_offset;
+        return aie_partition_read_privileged_mem(aie_dev, offset, size, p_read_mem);
+}
+
+// Write to handshake memory
+static inline int
+ve2_partition_write_privileged_mem(struct device *aie_dev, u32 lead_col, u32 col,
+		size_t field_offset, size_t size, void *p_write_mem)
+{
+        u32 offset;
+
+#if KERNEL_VERSION(6, 10, 0) > LINUX_VERSION_CODE
+        col = col + lead_col;
+#endif
+        offset = CERT_HANDSHAKE_OFF(col) + field_offset;
+        return aie_partition_write_privileged_mem(aie_dev, offset, size, p_write_mem);
+}
+
+// Wake up cert via UC wakeup
+static inline int 
+ve2_partition_uc_wakeup(struct device *aie_dev, u32 lead_col, u32 col)
+{
+#if KERNEL_VERSION(6, 10, 0) > LINUX_VERSION_CODE
+        col = col + lead_col;
+#endif
+        struct aie_location loc = { .col = col };
+        return aie_partition_uc_wakeup(aie_dev, &loc);
+}
+
+static inline int 
+ve2_partition_write(struct device *aie_dev, u32 lead_col,
+		u32 col, u32 row, u32 offset, size_t size, void *buf)
+{
+#if KERNEL_VERSION(6, 10, 0) > LINUX_VERSION_CODE
+	col = col + lead_col;
+#endif
+	struct aie_location loc = { .col = col };
+	loc.row = row;
+
+	return aie_partition_write(aie_dev, loc, offset,
+			size, buf, 0);
+}
+
+static inline int 
+ve2_partition_read(struct device *aie_dev, u32 lead_col,
+		u32 col, u32 row, u32 offset, size_t size, void *buf)
+{
+#if KERNEL_VERSION(6, 10, 0) > LINUX_VERSION_CODE
+	col = col + lead_col;
+#endif
+	struct aie_location loc = { .col = col };
+	loc.row = row;
+
+	return aie_partition_read(aie_dev, loc, offset, size, buf);
+}
+
+static inline int 
+ve2_partition_initialize(struct device *dev,
+		struct aie_partition_init_args *args)
+{
+#if KERNEL_VERSION(6, 10, 0) <= LINUX_VERSION_CODE
+        args->init_opts = (AIE_PART_INIT_OPT_DEFAULT | AIE_PART_INIT_OPT_DIS_TLAST_ERROR) ^ AIE_PART_INIT_OPT_UC_ENB_MEM_PRIV;
+#else
+        args->init_opts = AIE_PART_INIT_OPT_DEFAULT ^ AIE_PART_INIT_OPT_UC_ENB_MEM_PRIV;
+
+#endif
+        return aie_partition_initialize(dev, args);
+}
+
 int ve2_mgmt_create_partition(struct amdxdna_dev *xdna, struct amdxdna_ctx *hwctx);
 int ve2_mgmt_destroy_partition(struct amdxdna_ctx *hwctx);
 struct amdxdna_ctx *ve2_get_hwctx(struct amdxdna_dev *xdna, u32 col);
 int notify_fw_cmd_ready(struct amdxdna_ctx *hwctx);
+
+int ve2_xrs_request(struct amdxdna_dev *xdna, struct amdxdna_ctx *hwctx);
+int ve2_mgmt_schedule_cmd(struct amdxdna_dev *xdna,
+                struct amdxdna_ctx *hwctx, u64 seq);
+void ve2_mgmt_handshake_init(struct amdxdna_dev *xdna, struct amdxdna_ctx *hwctx);
 
 #endif /* _VE2_MGMT_H_ */

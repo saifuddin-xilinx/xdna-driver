@@ -19,6 +19,18 @@ int verbosity;
 module_param(verbosity, int, 0644);
 MODULE_PARM_DESC(verbosity, "[Debug] Enabling verbosity. default is 0");
 
+int start_col = -1;
+module_param(start_col, int, 0644);
+MODULE_PARM_DESC(start_col, "Test only option: lead column set to start_col");
+
+int partition_size = 4;
+module_param(partition_size, int, 0644);
+MODULE_PARM_DESC(partition_size, "Test only option: default partition size");
+
+uint32_t opcode_timeout = 0;
+module_param(opcode_timeout, uint, 0644);
+MODULE_PARM_DESC(opcode_timeout, "Opcode timeout config by user");
+
 #define CTX_TIMER	(nsecs_to_jiffies(1))
 
 /*
@@ -53,7 +65,7 @@ static int hsa_queue_reserve_slot(struct amdxdna_dev *xdna, struct amdxdna_ctx_p
 {
 	struct ve2_hsa_queue *queue = &priv->hwctx_hsa_queue;
 	struct host_queue_header *header = &queue->hsa_queue_p->hq_header;
-	int ret;
+	int ret = 0;
 
 	mutex_lock(&queue->hq_lock);
 	if (header->write_index < header->read_index) {
@@ -458,6 +470,8 @@ static int submit_command(struct amdxdna_ctx *hwctx, void *cmd_data, u64 *seq)
 	hdr->common_header.opcode = HOST_QUEUE_PACKET_EXEC_BUF;
 	hdr->completion_signal =
 		(u64)(hq_queue->hq_complete.hqc_dma_addr + slot_id * sizeof(u64));
+#define XRT_PKT_OPCODE(p) ((p)->xrt_header.common_header.opcode)
+	XDNA_DBG(xdna, "Queue packet opcode: %u\n", XRT_PKT_OPCODE(pkt));
 
 	hdr->common_header.count = sizeof(struct exec_buf);
 	hdr->common_header.distribute = 0;
@@ -561,6 +575,11 @@ int ve2_cmd_submit(struct amdxdna_ctx *hwctx, struct amdxdna_sched_job *job, u32
 	int ret;
 	u32 op;
 
+	if(hwctx->priv->misc_intrpt_flag == true) {
+		XDNA_ERR(xdna, "Failed to submit a command, because of misc interrupt\n");
+		return -EINVAL;
+	}
+
 	op = amdxdna_cmd_get_op(cmd_bo);
 	if (op != ERT_START_DPU && op != ERT_CMD_CHAIN) {
 		XDNA_WARN(xdna, "Unsupported ERT cmd: %d received", op);
@@ -577,8 +596,8 @@ int ve2_cmd_submit(struct amdxdna_ctx *hwctx, struct amdxdna_sched_job *job, u32
 		return ret;
 	}
 
-	//TODO: return value will be handled in future commit.
-	notify_fw_cmd_ready(hwctx);
+	XDNA_DBG(xdna, "Command submitted with temporal sharing enabled");
+	ve2_mgmt_schedule_cmd(xdna, hwctx, *seq);
 
 	return 0;
 }
@@ -595,6 +614,13 @@ static inline bool check_read_index(struct amdxdna_ctx_priv *priv_ctx, struct am
 	u64 *read_index;
 
 	mutex_lock(&queue->hq_lock);
+	
+	/* SAIF : FIX me. We are not modifying this under a lock */
+	if(priv_ctx->misc_intrpt_flag == true) {
+		mutex_unlock(&queue->hq_lock);
+		return true;
+	}
+
 	read_index = (u64 *)((char *)priv_ctx->hwctx_hsa_queue.hsa_queue_p +
 		HSA_QUEUE_READ_INDEX_OFFSET);
 	if (counter % print_interval == 0) {
@@ -641,6 +667,19 @@ int ve2_cmd_wait(struct amdxdna_ctx *hwctx, u64 seq, u32 timeout)
 		if (unlikely(!job)) {
 			ret = 0;
 			goto out;
+		}
+
+		if (priv_ctx->misc_intrpt_flag) {
+			struct device *aie_dev = hwctx->priv->aie_dev;
+			misc_info_t data = {0};
+
+		        ve2_partition_read_privileged_mem(aie_dev, hwctx->start_col, 0,
+		                        offsetof(struct handshake, misc_status),
+					sizeof(misc_info_t), (void *)&data);
+			amdxdna_cmd_set_state(job->cmd_bo, ERT_CMD_STATE_TIMEOUT);
+			XDNA_INFO(xdna, "MISC interrupt happened!!\n");
+			XDNA_INFO(xdna, "FW_STATE=%x\nABS_PAGE_INDEX=%d\nPPC=%x\n", data.fw_state,
+					data.abs_page_index, data.ppc);
 		}
 
 		if (timeout_jiffies && !ret) {
@@ -728,7 +767,7 @@ int ve2_hwctx_init(struct amdxdna_ctx *hwctx)
 	if (ret)
 		goto free_priv;
 
-	ret = ve2_mgmt_create_partition(xdna, hwctx);
+	ret = ve2_xrs_request(xdna, hwctx);
 	if (ret)
 		goto free_hsa_queue;
 
@@ -737,6 +776,8 @@ int ve2_hwctx_init(struct amdxdna_ctx *hwctx)
 		timer_setup(&priv->event_timer, timeout_cb, 0);
 		mod_timer(&priv->event_timer, jiffies + CTX_TIMER);
 	}
+	else 
+		XDNA_INFO(xdna, "Running in interrupt mode");
 
 	if (verbosity >= VERBOSITY_LEVEL_DBG)
 		ve2_clear_firmware_status(xdna, hwctx);
@@ -780,64 +821,41 @@ void ve2_hwctx_fini(struct amdxdna_ctx *hwctx)
 static int ve2_update_handshake_pkt(struct amdxdna_ctx *hwctx, u8 buf_type, u64 paddr,
 				    u32 buf_sz, u32 col, bool attach)
 {
-	struct device *aie_dev = hwctx->priv->aie_part;
-	struct handshake hs = { 0 };
-	int ret;
-
-	WARN_ON(!aie_dev);
+        struct amdxdna_ctx_priv *nhwctx = hwctx->priv;
 
 	switch (buf_type) {
 	case AMDXDNA_FW_BUF_DEBUG:
-		if (attach) {
-			hs.dbg_buf.dbg_buf_addr_high = upper_32_bits(paddr);
-			hs.dbg_buf.dbg_buf_addr_low = lower_32_bits(paddr);
-			hs.dbg_buf.size = buf_sz;
-		}
-		ret = aie_partition_write_privileged_mem(aie_dev, CERT_HANDSHAKE_OFF(col) +
-							 offsetof(struct handshake,
-								  dbg_buf.dbg_buf_addr_high),
-							 sizeof(hs.dbg_buf), (void *)&hs.dbg_buf);
-		break;
-	case AMDXDNA_FW_BUF_TRACE:
-		if (attach) {
-			hs.trace.dtrace_addr_high = upper_32_bits(paddr);
-			hs.trace.dtrace_addr_low = lower_32_bits(paddr);
-		}
-		ret = aie_partition_write_privileged_mem(aie_dev, CERT_HANDSHAKE_OFF(col) +
-							 offsetof(struct handshake,
-								  trace.dtrace_addr_high),
-							 sizeof(hs.trace), (void *)&hs.trace);
-		break;
-	case AMDXDNA_FW_BUF_LOG:
-		if (attach) {
-			hs.log_addr_high = upper_32_bits(paddr);
-			hs.log_addr_low = lower_32_bits(paddr);
-			hs.log_buf_size = buf_sz;
-		}
-		ret = aie_partition_write_privileged_mem(aie_dev, CERT_HANDSHAKE_OFF(col) +
-							 offsetof(struct handshake, log_addr_high),
-							 sizeof(hs.log_addr_high) +
-							 sizeof(hs.log_addr_high) +
-							 sizeof(hs.log_buf_size),
-							 (void *)&hs.log_addr_high);
-		break;
-	default:
-		ret = -EOPNOTSUPP;
-		break;
-	}
+                nhwctx->hwctx_config[hwctx->start_col + col].debug_buf_addr = paddr;
+                nhwctx->hwctx_config[hwctx->start_col + col].debug_buf_size = buf_sz;
+                break;
 
-	return ret;
+        case AMDXDNA_FW_BUF_TRACE:		
+                nhwctx->hwctx_config[hwctx->start_col + col].dtrace_addr = paddr;
+		break;
+
+        case AMDXDNA_FW_BUF_LOG:
+		nhwctx->hwctx_config[hwctx->start_col + col].log_buf_addr = paddr;
+                nhwctx->hwctx_config[hwctx->start_col + col].log_buf_size = buf_sz;
+                break;
+
+        default:
+                struct amdxdna_dev *xdna = hwctx->client->xdna;
+	        XDNA_ERR(xdna, "Invalid Request");
+                return -EOPNOTSUPP;
+        }
+
+	return 0;
 }
 
 static int ve2_hwctx_config_op_timeout(struct amdxdna_ctx *hwctx, u32 op_timeout)
 {
-	struct device *aie_dev = hwctx->priv->aie_part;
+	struct device *aie_dev = hwctx->priv->aie_dev;
 	struct handshake hs = { 0 };
 	int ret;
 
 	hs.opcode_timeout_config = op_timeout;
 	for (u32 col = 0; col < hwctx->num_col; col++) {
-		ret = aie_partition_write_privileged_mem(aie_dev, CERT_HANDSHAKE_OFF(col) +
+		ret = ve2_partition_write_privileged_mem(aie_dev, hwctx->start_col,col,
 							 offsetof(struct handshake,
 								  opcode_timeout_config),
 							 sizeof(u32),
@@ -875,6 +893,7 @@ int ve2_hwctx_config(struct amdxdna_ctx *hwctx, u32 type, u64 val, void *buf, u3
 			amdxdna_gem_put_obj(mdata_abo);
 			return -EINVAL;
 		}
+
 		abo = amdxdna_gem_get_obj(client, mdata->bo_handle, AMDXDNA_BO_DEV);
 		if (!abo || !abo->mem.kva) {
 			XDNA_ERR(xdna, "Get bo %lld failed for type %d", mdata->bo_handle, type);
@@ -904,7 +923,8 @@ int ve2_hwctx_config(struct amdxdna_ctx *hwctx, u32 type, u64 val, void *buf, u3
 		amdxdna_gem_put_obj(abo);
 		amdxdna_gem_put_obj(mdata_abo);
 		break;
-	case DRM_AMDXDNA_HWCTX_REMOVE_DBG_BUF:
+
+        case DRM_AMDXDNA_HWCTX_REMOVE_DBG_BUF:
 		mdata_abo = amdxdna_gem_get_obj(client, val, AMDXDNA_BO_DEV);
 		if (!mdata_abo || !mdata_abo->mem.kva) {
 			XDNA_ERR(xdna, "Get metadata bo %lld failed for type %d", val, type);
@@ -930,7 +950,8 @@ int ve2_hwctx_config(struct amdxdna_ctx *hwctx, u32 type, u64 val, void *buf, u3
 
 		amdxdna_gem_put_obj(mdata_abo);
 		break;
-	case DRM_AMDXDNA_HWCTX_CONFIG_OPCODE_TIMEOUT:
+
+        case DRM_AMDXDNA_HWCTX_CONFIG_OPCODE_TIMEOUT:
 		if (copy_from_user(&op_timeout, (u32 __user *)val, sizeof(u32)))
 			return -EFAULT;
 		ret = ve2_hwctx_config_op_timeout(hwctx, op_timeout);
@@ -940,7 +961,8 @@ int ve2_hwctx_config(struct amdxdna_ctx *hwctx, u32 type, u64 val, void *buf, u3
 			XDNA_DBG(xdna, "Configured opcode timeout %u on hwctx %s", op_timeout,
 				 hwctx->name);
 		break;
-	default:
+
+        default:
 		XDNA_DBG(xdna, "%s Not supported type %d", __func__, type);
 		ret = -EOPNOTSUPP;
 		amdxdna_gem_put_obj(mdata_abo);
