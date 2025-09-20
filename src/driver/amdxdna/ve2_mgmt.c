@@ -40,6 +40,9 @@ static void cert_setup_partition(struct amdxdna_dev *xdna, struct device *aie_de
         cert_comm.trace.dtrace_addr_high = upper_32_bits(hwctx_cfg->dtrace_addr);
         cert_comm.trace.dtrace_addr_low = lower_32_bits(hwctx_cfg->dtrace_addr);
 
+	/* Opcode Timeout */
+	cert_comm.opcode_timeout_config = hwctx_cfg->opcode_timeout_config;
+
 	cert_comm.ctx_switch_req = 0;
 	cert_comm.hsa_location = 0;
 	cert_comm.dbg.hsa_addr_high = 0xFFFFFFFF;
@@ -217,7 +220,8 @@ void ve2_mgmt_handshake_init(struct amdxdna_dev *xdna,
 		return;
 	}
 
-	for (u32 col = 0; col < num_col; col++) {
+	/* We should make sure the lead CERT has to start at last */
+	for (int col = num_col - 1; col >= 0; col--) {
 		u64 hsa_addr = 0xFFFFFFFFFFFFFFFF;
 
 		/*
@@ -250,8 +254,7 @@ static int ve2_request_context_switch(struct amdxdna_dev *xdna,
 			offsetof(struct handshake, ctx_switch_req),
 			sizeof(u32), (void *)&val);
 
-	ve2_partition_read_privileged_mem(aie_dev, mgmtctx->start_col, 0,
-		       offsetof(struct handshake, ctx_switch_req), sizeof(u32), &val);
+	mgmtctx->is_context_req = 1;
 
 	return 0;
 }
@@ -272,18 +275,16 @@ ve2_response_ctx_switch_req(struct amdxdna_mgmtctx *mgmtctx)
 
 	/* Top need to be scheduled */
 	list_for_each_entry_safe(c_ctx, t_ctx, &mgmtctx->ctx_command_fifo_head, list) {
-		hwctx = c_ctx->ctx;
-		XDNA_DBG(xdna, "Context : %p\n", hwctx);
-		if (mgmtctx->active_ctx == hwctx)
-		{
-			notify_fw_cmd_ready(hwctx);
-			break;
-                }
+		if (mgmtctx->is_idle_due_to_context == 1) {
+			hwctx = c_ctx->ctx;
+			XDNA_DBG(xdna, "NEW context to be schedule next: %p\n", hwctx);
+			mgmtctx->is_partition_idle = 0;
+			ve2_mgmt_handshake_init(mgmtctx->xdna, hwctx);
+			if (mgmtctx->active_ctx == hwctx)
+				break;
 
-		XDNA_DBG(xdna, "NEW context : %p\n", hwctx);
-		mgmtctx->is_partition_idle = 0;
-		ve2_mgmt_handshake_init(mgmtctx->xdna, hwctx);
-		mgmtctx->active_ctx = hwctx;
+			mgmtctx->active_ctx = hwctx;
+		}
 
 		if (t_ctx && c_ctx->ctx != t_ctx->ctx)
 			ve2_request_context_switch(mgmtctx->xdna, mgmtctx);
@@ -327,11 +328,31 @@ int ve2_mgmt_schedule_cmd(struct amdxdna_dev *xdna, struct amdxdna_ctx *hwctx,
 			XDNA_DBG(mgmtctx->xdna, "Commad pushed in queue as active context:%p  new context:%p \n", mgmtctx->active_ctx, hwctx);
 		}
 	}
+	else {
+		if (mgmtctx->is_idle_due_to_context == 1) {
+			mgmtctx->is_idle_due_to_context = 0;
+			mgmtctx->is_partition_idle = 0;
+			ve2_mgmt_handshake_init(xdna, hwctx);
+			mgmtctx->active_ctx = hwctx;
+		}
+	}
 
 	spin_unlock(&mgmtctx->ctx_lock);
 	notify_fw_cmd_ready(mgmtctx->active_ctx);
 
 	return 0;
+}
+
+static bool ve2_check_context_req(struct amdxdna_mgmtctx  *mgmtctx)
+{
+        if (mgmtctx->is_context_req == 1)
+        {
+                mgmtctx->is_context_req = 0;
+                mgmtctx->is_idle_due_to_context = 1;
+                return true;
+        }
+
+        return false;
 }
 
 static bool ve2_check_idle(struct amdxdna_mgmtctx  *mgmtctx)
@@ -344,9 +365,6 @@ static bool ve2_check_idle(struct amdxdna_mgmtctx  *mgmtctx)
 		       offsetof(struct handshake, cert_idle_status),
 		       sizeof(cert_idle_status), (void *)&cert_idle_status);
 	
-	ve2_partition_read_privileged_mem(aie_dev, mgmtctx->start_col, 0,
-		       offsetof(struct handshake, ctx_switch_req), sizeof(u32), &val);
-
 	/* Make it always true for now */
 	if (cert_idle_status & CERT_IS_IDLE) {
 		XDNA_DBG(mgmtctx->xdna, "%s: active hwctx %p cert_idle_status:%x cert_ctx_switch_bit:%x -->FOUND\n",
@@ -369,9 +387,6 @@ static bool ve2_check_queue_not_empty(struct amdxdna_mgmtctx  *mgmtctx)
 		       offsetof(struct handshake, cert_idle_status),
 		       sizeof(cert_idle_status), (void *)&cert_idle_status);
 	
-	ve2_partition_read_privileged_mem(aie_dev, mgmtctx->start_col, 0,
-		       offsetof(struct handshake, ctx_switch_req), sizeof(u32), &val);
-
 	/* Make it always true for now */
 	if (cert_idle_status & HSA_QUEUE_NOT_EMPTY) {
 		XDNA_DBG(mgmtctx->xdna, "%s: active hwctx %p cert_idle_status:%x cert_ctx_switch_bit:%x -->FOUND\n",
@@ -395,6 +410,7 @@ static bool ve2_check_misc_interrupt(struct amdxdna_mgmtctx *mgmtctx)
         /*This may occur when control code is hanged or any exception*/
         if(misc_status != 0)
         {
+		BUG_ON(!mgmtctx->active_ctx);
                 mgmtctx->active_ctx->priv->misc_intrpt_flag = true;
                 return true;
         }
@@ -433,6 +449,9 @@ static void ve2_scheduler_work(struct work_struct *work)
 		2. idle bit is set
 		3. queue_not_empty bit is set
 	*/
+
+	ve2_check_context_req(mgmtctx);
+
 	if(mgmtctx->active_ctx->priv->misc_intrpt_flag == true) {
 		XDNA_ERR(mgmtctx->xdna, "MISC interrupt from firmware!!!\n");
 	}

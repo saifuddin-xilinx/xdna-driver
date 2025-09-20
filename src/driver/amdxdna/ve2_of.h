@@ -103,6 +103,8 @@ struct amdxdna_mgmtctx {
         struct work_struct              sched_work;
         struct workqueue_struct         *mgmtctx_workq;
         volatile u32                    is_partition_idle;
+	volatile u32                    is_context_req;
+        volatile u32                    is_idle_due_to_context;
 };
 
 struct amdxdna_dev_hdl {
