@@ -25,6 +25,7 @@ extern int verbosity;
 extern int start_col;
 extern int partition_size;
 extern u32 opcode_timeout;
+extern u32 ve2_hwctx_limit;
 
 struct aie_version {
         u16 major;
@@ -81,6 +82,7 @@ struct amdxdna_ctx_priv {
 	struct amdxdna_sched_job        *pending[HWCTX_MAX_CMDS];
 	struct timer_list	        event_timer;
         volatile bool                   misc_intrpt_flag;
+	struct mutex                    privctx_lock; /* protect private ctx */
 };
 
 struct amdxdna_dev_priv {

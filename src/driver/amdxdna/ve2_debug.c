@@ -6,8 +6,8 @@
 #include <linux/version.h>
 
 #include "ve2_fw.h"
-#include "ve2_mgmt.h"
 #include "ve2_of.h"
+#include "ve2_mgmt.h"
 #include "ve2_res_solver.h"
 
 static int ve2_get_hwctx_status(struct amdxdna_client *client, struct amdxdna_drm_get_info *args)

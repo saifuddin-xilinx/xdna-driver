@@ -188,22 +188,6 @@ static int ve2_fifo_enqueue(struct amdxdna_mgmtctx *mgmtctx,
         return 0;
 }
 
-// Get the read index from the context's HSA queue
-static u64 get_ctx_read_index(struct amdxdna_ctx *hwctx)
-{
-	u64 *read_index = (u64 *)((char *)hwctx->priv->hwctx_hsa_queue.hsa_queue_p +
-			HSA_QUEUE_READ_INDEX_OFFSET);
-	return *read_index;
-}
-
-// Get the write index from the context's HSA queue
-static u64 get_ctx_write_index(struct amdxdna_ctx *hwctx)
-{        
-	u64 *write_index = (u64 *)((char *)hwctx->priv->hwctx_hsa_queue.hsa_queue_p +
-			HSA_QUEUE_WRITE_INDEX_OFFSET);
-	return *write_index;
-}
-
 // Get the context switch request bit
 static u32 get_ctx_bit(struct amdxdna_mgmtctx *mgmtctx)
 {

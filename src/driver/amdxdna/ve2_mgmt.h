@@ -131,6 +131,30 @@ ve2_partition_initialize(struct device *dev,
         return aie_partition_initialize(dev, args);
 }
 
+static inline u64 get_ctx_read_index(struct amdxdna_ctx *hwctx)
+{
+        u64 *read_index = (u64 *)((char *)hwctx->priv->hwctx_hsa_queue.hsa_queue_p +
+                        HSA_QUEUE_READ_INDEX_OFFSET);
+        return *read_index;
+}
+
+static inline u64 get_ctx_write_index(struct amdxdna_ctx *hwctx)
+{
+        u64 *write_index = (u64 *)((char *)hwctx->priv->hwctx_hsa_queue.hsa_queue_p +
+                        HSA_QUEUE_WRITE_INDEX_OFFSET);
+        return *write_index;
+}
+
+static inline void update_ctx_write_index(struct amdxdna_ctx *hwctx, int incr_cnt)
+{
+	struct ve2_hsa_queue *queue = &hwctx->priv->hwctx_hsa_queue;
+	struct host_queue_header *header = &queue->hsa_queue_p->hq_header;
+
+	mutex_lock(&queue->hq_lock);
+	header->write_index += (u64)incr_cnt;
+	mutex_unlock(&queue->hq_lock);
+}
+
 int ve2_mgmt_create_partition(struct amdxdna_dev *xdna, struct amdxdna_ctx *hwctx);
 int ve2_mgmt_destroy_partition(struct amdxdna_ctx *hwctx);
 struct amdxdna_ctx *ve2_get_hwctx(struct amdxdna_dev *xdna, u32 col);

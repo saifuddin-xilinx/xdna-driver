@@ -11,7 +11,7 @@
 #include "ve2_mgmt.h"
 #include "ve2_res_solver.h"
 
-int enable_polling;
+int enable_polling = 0;
 module_param(enable_polling, int, 0644);
 MODULE_PARM_DESC(enable_polling, "Enable polling mode. Polling mode disabled by default.");
 
@@ -19,17 +19,25 @@ int verbosity;
 module_param(verbosity, int, 0644);
 MODULE_PARM_DESC(verbosity, "[Debug] Enabling verbosity. default is 0");
 
-int start_col = -1;
-module_param(start_col, int, 0644);
-MODULE_PARM_DESC(start_col, "Test only option: lead column set to start_col");
-
 int partition_size = 4;
 module_param(partition_size, int, 0644);
 MODULE_PARM_DESC(partition_size, "Test only option: default partition size");
 
-uint32_t opcode_timeout = 0;
+unsigned int opcode_timeout = 0;
 module_param(opcode_timeout, uint, 0644);
 MODULE_PARM_DESC(opcode_timeout, "Opcode timeout config by user");
+
+unsigned int ve2_hwctx_limit;
+module_param(ve2_hwctx_limit, uint, 0400);
+MODULE_PARM_DESC(ve2_hwctx_limit, "[Debug] Maximum number of hwctx. 0 = Use default");
+
+int start_col = 0;
+module_param(start_col, int, 0644);
+MODULE_PARM_DESC(start_col, "Test only option: lead column set to start_col");
+
+int max_col = 0;
+module_param(max_col, int, 0644);
+MODULE_PARM_DESC(max_col, "Max column supported by this driver");
 
 #define CTX_TIMER	(nsecs_to_jiffies(1))
 
@@ -65,23 +73,24 @@ static int hsa_queue_reserve_slot(struct amdxdna_dev *xdna, struct amdxdna_ctx_p
 {
 	struct ve2_hsa_queue *queue = &priv->hwctx_hsa_queue;
 	struct host_queue_header *header = &queue->hsa_queue_p->hq_header;
-	int ret = 0;
 
 	mutex_lock(&queue->hq_lock);
 	if (header->write_index < header->read_index) {
-		XDNA_ERR(xdna, "Error: HSA Queue read %llx before write %llx", header->read_index,
-			 header->write_index);
-		ret = -EINVAL;
+		XDNA_ERR(xdna, "HSA Queue read %llx before write %llx",
+			 header->read_index, header->write_index);
+		mutex_unlock(&queue->hq_lock);
+		return -EINVAL;
 	} else if ((header->write_index - header->read_index) < header->capacity) {
-		*slot = header->write_index++;
-		XDNA_DBG(xdna, "reserved slot %lld", *slot);
+		*slot = header->write_index;
+		XDNA_DBG(xdna, "slot %lld", *slot);
 	} else {
-		XDNA_ERR(xdna, "Error: HSQ Queue is full");
-		ret = -EIO;
+		XDNA_ERR(xdna, "HSQ Queue is full");
+		mutex_unlock(&queue->hq_lock);
+		return -EIO;
 	}
-	mutex_unlock(&queue->hq_lock);
 
-	return ret;
+	mutex_unlock(&queue->hq_lock);
+	return 0;
 }
 
 static void ve2_job_release(struct kref *ref)
@@ -101,25 +110,23 @@ static void ve2_job_put(struct amdxdna_sched_job *job)
 static inline int ve2_hwctx_add_job(struct amdxdna_ctx *hwctx, struct amdxdna_sched_job *job,
 				    u64 seq, u32 cmd_cnt)
 {
-	struct amdxdna_sched_job *other_job;
+	struct amdxdna_dev *xdna = hwctx->client->xdna;
 	int idx;
 
+	mutex_lock(&hwctx->priv->privctx_lock);
 	hwctx->submitted += cmd_cnt;
 	job->seq = seq;
 
 	idx = get_job_idx(job->seq);
-	// When pending list full, hwctx->submitted points to oldest fence
-	other_job = hwctx->priv->pending[idx];
-	if (other_job && other_job->fence)
-		return -EAGAIN;
-
-	if (other_job) {
-		dma_fence_put(other_job->fence);
-		ve2_job_put(other_job);
+	if (hwctx->priv->pending[idx]) {
+		XDNA_ERR(xdna, "No more room for new command!!!");
+		mutex_unlock(&hwctx->priv->privctx_lock);
+		return -EINVAL;
 	}
 
 	hwctx->priv->pending[idx] = job;
 	kref_get(&job->refcnt);
+	mutex_unlock(&hwctx->priv->privctx_lock);
 
 	return 0;
 }
@@ -139,11 +146,11 @@ static inline void ve2_hwctx_job_release(struct amdxdna_ctx *hwctx, struct amdxd
 	}
 	drm_gem_object_put(to_gobj(job->cmd_bo));
 
+	mutex_lock(&hwctx->priv->privctx_lock);
 	// Reset the pending list
 	hwctx->priv->pending[get_job_idx(job->seq)] = NULL;
-	if (job->fence)
-		dma_fence_put(job->fence);
-	kfree(job);
+	ve2_job_put(job);
+	mutex_unlock(&hwctx->priv->privctx_lock);
 }
 
 static inline struct host_queue_packet *hsa_queue_get_pkt(struct hsa_queue *queue, u64 slot)
@@ -374,8 +381,9 @@ static int submit_command_indirect(struct amdxdna_ctx *hwctx, void *cmd_data, u6
 		return -EINVAL;
 	}
 
-	*seq = slot_id;
-	slot_id = slot_id & (queue->hq_header.capacity - 1);
+        *seq = slot_id;
+        XDNA_DBG(xdna, "slot %llx is selected", slot_id);
+        slot_id = slot_id & (queue->hq_header.capacity - 1);
 
 	hdr = &pkt->xrt_header;
 	hdr->common_header.opcode = HOST_QUEUE_PACKET_EXEC_BUF;
@@ -435,6 +443,8 @@ static int submit_command_indirect(struct amdxdna_ctx *hwctx, void *cmd_data, u6
 		packet_dump(xdna, queue, slot_id);
 
 	hsa_queue_pkt_set_valid(pkt);
+	/* Update write index here */
+	update_ctx_write_index(hwctx, 1);
 
 	return 0;
 }
@@ -488,6 +498,8 @@ static int submit_command(struct amdxdna_ctx *hwctx, void *cmd_data, u64 *seq)
 	XDNA_DBG(xdna, "dpu instruction addr: 0x%llx", dpu_cmd->instruction_buffer);
 
 	hsa_queue_pkt_set_valid(pkt);
+	/* Update write index here */
+	update_ctx_write_index(hwctx, 1);
 
 	return 0;
 }
@@ -606,107 +618,114 @@ int ve2_cmd_submit(struct amdxdna_ctx *hwctx, struct amdxdna_sched_job *job, u32
  * Handling interrupt notification based on read_index and write_index.
  */
 static inline bool check_read_index(struct amdxdna_ctx_priv *priv_ctx, struct amdxdna_ctx *hwctx,
-				    struct amdxdna_dev *xdna, u64 seq)
+                struct amdxdna_dev *xdna, u64 seq, u32 print_interval)
 {
-	struct ve2_hsa_queue *queue = &priv_ctx->hwctx_hsa_queue;
-	u32 print_interval = 300;
 	static u64 counter;
-	u64 *read_index;
 
-	mutex_lock(&queue->hq_lock);
-	
-	/* SAIF : FIX me. We are not modifying this under a lock */
-	if(priv_ctx->misc_intrpt_flag == true) {
-		mutex_unlock(&queue->hq_lock);
+	if(priv_ctx->misc_intrpt_flag == true)
 		return true;
-	}
 
-	read_index = (u64 *)((char *)priv_ctx->hwctx_hsa_queue.hsa_queue_p +
-		HSA_QUEUE_READ_INDEX_OFFSET);
-	if (counter % print_interval == 0) {
+	u64 *read_index = (u64 *)((char *)priv_ctx->hwctx_hsa_queue.hsa_queue_p +
+				HSA_QUEUE_READ_INDEX_OFFSET);
+
+	if(counter % print_interval == 0) {
 		XDNA_DBG(xdna, "read idx addr (0x%llx)", (u64)read_index);
 		XDNA_WARN(xdna, "hwctx [%p] check read idx (%lld) > cmd idx (%lld)", hwctx,
 			  *read_index, seq);
 	}
 	counter++;
-	mutex_unlock(&queue->hq_lock);
-
 	return ((*read_index) > seq);
 }
 
 int ve2_cmd_wait(struct amdxdna_ctx *hwctx, u64 seq, u32 timeout)
 {
 	struct amdxdna_ctx_priv *priv_ctx = hwctx->priv;
+	struct ve2_hsa_queue *queue = &priv_ctx->hwctx_hsa_queue;
 	struct amdxdna_client *client = hwctx->client;
 	struct amdxdna_dev *xdna = client->xdna;
 	struct amdxdna_sched_job *job;
-	unsigned long timeout_jiffies;
-	int ret;
+	u32 print_interval = 300;
+	unsigned long wait_jifs;
+	int ret = 0;
 
 	/*
 	 * NOTE: this is simplified hwctx which has no col_entry list for different ctx
 	 * sharing the same lead col.
 	 * The current version assumes one hwctx is 1:1 mapping with one lead cert col
 	 */
-	timeout_jiffies = msecs_to_jiffies(timeout);
-	if (timeout_jiffies)
+	wait_jifs = msecs_to_jiffies(timeout);
+	mutex_lock(&queue->hq_lock);
+	if (wait_jifs)
 		ret = wait_event_interruptible_timeout(priv_ctx->waitq,
-						       check_read_index(priv_ctx, hwctx, xdna, seq),
-						       timeout_jiffies);
+				check_read_index(priv_ctx, hwctx, xdna, seq, print_interval),
+				wait_jifs);
 	else
 		ret = wait_event_interruptible(priv_ctx->waitq,
-					       check_read_index(priv_ctx, hwctx, xdna, seq));
+				check_read_index(priv_ctx, hwctx, xdna, seq, print_interval));
+	mutex_unlock(&queue->hq_lock);
 
-	XDNA_DBG(xdna, "wait_event returned %d (timeout_jiffies=%lu)", ret, timeout_jiffies);
+	XDNA_DBG(xdna, "wait_event returned %d (timeout_jiffies=%lu)", ret, wait_jifs);
 
-	if (ret == -ERESTARTSYS)
-		return ret;
-
-	if ((!timeout_jiffies && !ret) || ret > 0) {
+	if ((!wait_jifs && !ret) || ret > 0) {
 		job = ve2_hwctx_get_job(hwctx, seq);
 		if (unlikely(!job)) {
 			ret = 0;
 			goto out;
 		}
 
+		//amdxdna_cmd_set_state(job->cmd_bo, queue->hq_complete.hqc_mem[seq]);
+		// below check need to be removed once we have a clean solution
+		// to use completion signal
 		if (priv_ctx->misc_intrpt_flag) {
-			struct device *aie_dev = hwctx->priv->aie_dev;
-			misc_info_t data = {0};
+			struct device *aie_dev = priv_ctx->aie_dev;
+			struct handshake *hs = NULL;
+			int ret = 0;
+			hs = kmalloc(sizeof(struct handshake), GFP_KERNEL);
+			if (!hs) {
+				XDNA_ERR(xdna, "No memory for handshake.\n");
+				return -ENOMEM;
+			}
 
-		        ve2_partition_read_privileged_mem(aie_dev, hwctx->start_col, 0,
-		                        offsetof(struct handshake, misc_status),
-					sizeof(misc_info_t), (void *)&data);
+		        ret = ve2_partition_read_privileged_mem(aie_dev, hwctx->start_col, 0,
+		                        offsetof(struct handshake, mpaie_alive),
+					sizeof(struct handshake), (void *)hs);
+
+			if (ret < 0) {
+				XDNA_ERR(xdna, "aie_partition_read failed with ret=%d\n", ret);
+				kfree(hs);
+				return ret; 
+			}
+
 			amdxdna_cmd_set_state(job->cmd_bo, ERT_CMD_STATE_TIMEOUT);
+
 			XDNA_INFO(xdna, "MISC interrupt happened!!\n");
-			XDNA_INFO(xdna, "FW_STATE=%x\nABS_PAGE_INDEX=%d\nPPC=%x\n", data.fw_state,
-					data.abs_page_index, data.ppc);
-		}
+			XDNA_INFO(xdna, "FW_STATE=%x\nABS_PAGE_INDEX=%d\nPPC=%x\n", hs->vm.fw_state,
+					hs->vm.abs_page_index, hs->vm.ppc);
 
-		if (timeout_jiffies && !ret) {
-			amdxdna_cmd_set_state(job->cmd_bo, ERT_CMD_STATE_TIMEOUT);
-			XDNA_ERR(xdna, "Requested command [%d] TIMEOUT!!", (int)seq);
-		} else {
-			amdxdna_cmd_set_state(job->cmd_bo, ERT_CMD_STATE_COMPLETED);
+			kfree(hs);
 		}
+		else if (wait_jifs && !ret) {
+                        amdxdna_cmd_set_state(job->cmd_bo, ERT_CMD_STATE_TIMEOUT);
+                        XDNA_INFO(xdna, "Requested command TIMEOUT!!");
+                }
+                else
+                        amdxdna_cmd_set_state(job->cmd_bo, ERT_CMD_STATE_COMPLETED);
 
 		ve2_hwctx_job_release(hwctx, job);
 
-		if (!timeout_jiffies) {
-			ret = 0;
-			goto out;
-		}
+		if (!wait_jifs)
+			return 0;
 	}
 
 	/*
 	 * wait_event_interruptible_timeout() returns 0 when the condition evaluated to false
 	 * after the timeout elapsed. So, return -ETIME in this case
 	 */
-	if (timeout_jiffies && !ret)
+	if (!ret)
 		ret = -ETIME;
 
 out:
-	XDNA_INFO(xdna, "Requested command [%d] finished with ret %d", (int)seq, ret);
-
+	XDNA_DBG(xdna, "wait_cmd ret:%d", ret);
 	/* 0 is success, others are timeout */
 	return ret > 0 ? 0 : ret;
 }
