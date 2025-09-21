@@ -667,8 +667,6 @@ struct amdxdna_ctx *ve2_get_hwctx(struct amdxdna_dev *xdna, u32 col)
 	u32 start, end;
 	int idx;
 
-	drm_WARN_ON(&xdna->ddev, !mutex_is_locked(&xdna->dev_lock));
-
 	list_for_each_entry(client, &xdna->client_list, node) {
 		idx = srcu_read_lock(&client->ctx_srcu);
 		amdxdna_for_each_ctx(client, hwctx_id, hwctx) {

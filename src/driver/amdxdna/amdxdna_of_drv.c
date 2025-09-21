@@ -26,8 +26,8 @@ MODULE_DEVICE_TABLE(of, amdxdna_of_table);
 
 static int amdxdna_of_probe(struct platform_device *pdev)
 {
-        struct init_config xrs_cfg = { 0 };
-        struct device *dev = &pdev->dev;
+	struct init_config xrs_cfg = { 0 };
+	struct device *dev = &pdev->dev;
 	const struct of_device_id *id;
 	struct amdxdna_dev *xdna;
 	int ret;
@@ -76,7 +76,7 @@ static int amdxdna_of_probe(struct platform_device *pdev)
 		ret = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(32));
 		if (ret) {
 			XDNA_ERR(xdna, "DMA configuration failed: 0x%x\n", ret);
-                        drm_dev_put(&xdna->ddev);
+			drm_dev_put(&xdna->ddev);
 			return ret;
 		}
 
@@ -86,7 +86,7 @@ static int amdxdna_of_probe(struct platform_device *pdev)
 	if (xdna->dev_info->ops->debugfs)
 		xdna->dev_info->ops->debugfs(xdna);
 
-        xrs_cfg.ddev = &xdna->ddev;
+	xrs_cfg.ddev = &xdna->ddev;
 
 	if (max_col > 0 && start_col >= 0 &&
 			(max_col + start_col) < XRS_MAX_COL) {
@@ -98,10 +98,10 @@ static int amdxdna_of_probe(struct platform_device *pdev)
 	if (xdna->dev_handle)
 		xdna->dev_handle->xrs_hdl = xrsm_init(&xrs_cfg);
 	if (!xdna->dev_handle || !xdna->dev_handle->xrs_hdl) {
-                XDNA_ERR(xdna, "Initialize resolver failed");
-                drm_dev_put(&xdna->ddev);
-                return -EINVAL;
-        }
+		XDNA_ERR(xdna, "Initialize resolver failed");
+		drm_dev_put(&xdna->ddev);
+		return -EINVAL;
+	}
 
 	iommu_mode = AMDXDNA_IOMMU_NO_PASID;
 
