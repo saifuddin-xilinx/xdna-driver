@@ -324,7 +324,7 @@ void amdxdna_sched_job_cleanup(struct amdxdna_sched_job *job)
 {
 	struct amdxdna_ctx *ctx = job->ctx;
 
-	trace_amdxdna_debug_point(ctx->name, job->seq, "job release");
+	/* trace_amdxdna_debug_point(ctx->name, job->seq, "job release"); */
 	amdxdna_arg_bos_put(job);
 	amdxdna_gem_put_obj(job->cmd_bo);
 	if (job->out_fence)
@@ -531,7 +531,7 @@ int amdxdna_cmd_submit(struct amdxdna_client *client, u32 opcode,
 	 * For here we can unlock SRCU.
 	 */
 	srcu_read_unlock(&client->ctx_srcu, idx);
-	trace_amdxdna_debug_point(ctx->name, *seq, "job pushed");
+	/* trace_amdxdna_debug_point(ctx->name, *seq, "job pushed"); */
 
 	return 0;
 
@@ -731,7 +731,7 @@ int amdxdna_drm_submit_cmd_ioctl(struct drm_device *dev, void *data, struct drm_
 	if (args->ext || args->ext_flags)
 		return -EINVAL;
 
-	trace_amdxdna_debug_point(current->comm, args->type, "job received");
+	/* trace_amdxdna_debug_point(current->comm, args->type, "job received"); */
 
 	switch (args->type) {
 	case AMDXDNA_CMD_SUBMIT_EXEC_BUF:
@@ -793,7 +793,7 @@ int amdxdna_drm_wait_cmd_ioctl(struct drm_device *dev, void *data, struct drm_fi
 	XDNA_DBG(xdna, "PID %d ctx %d cmd %lld wait finished, ret %d",
 		 client->pid, args->hwctx, args->seq, ret);
 
-	trace_amdxdna_debug_point(current->comm, args->seq, "job returned to user");
+	/* trace_amdxdna_debug_point(current->comm, args->seq, "job returned to user"); */
 	return ret;
 }
 

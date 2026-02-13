@@ -14,8 +14,9 @@
 #include "amdxdna_devel.h"
 #endif
 
-#define CREATE_TRACE_POINTS
-#include "amdxdna_trace.h"
+/* Trace points disabled for prototype build */
+/* #define CREATE_TRACE_POINTS */
+/* #include "amdxdna_trace.h" */
 
 static int amdxdna_drm_open(struct drm_device *ddev, struct drm_file *filp)
 {
