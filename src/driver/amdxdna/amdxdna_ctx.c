@@ -14,6 +14,7 @@
 #include "amdxdna_pm.h"
 #include "amdxdna_ctx.h"
 #include "amdxdna_trace.h"
+#include "amdxdna_hal_drv.h"
 
 #define MAX_CTX_ID		255
 #define MAX_ARG_COUNT		4095
@@ -63,7 +64,8 @@ static void amdxdna_ctx_destroy_rcu(struct amdxdna_ctx *ctx, struct srcu_struct 
 
 	synchronize_srcu(ss);
 
-	xdna->dev_info->ops->ctx_fini(ctx);
+	/* HAL layer integration: Route through HAL instead of direct ops call */
+	amdxdna_hal_hwctx_fini(ctx);
 	mutex_destroy(&ctx->io_lock);
 	kfree(ctx->name);
 	kfree(ctx);
@@ -142,7 +144,9 @@ int amdxdna_drm_create_hwctx_ioctl(struct drm_device *dev, void *data, struct dr
 		goto rm_id;
 	}
 
-	ret = xdna->dev_info->ops->ctx_init(ctx);
+	/* HAL layer integration: Route through HAL instead of direct ops call */
+	/* Execution flow: Context Creation */
+	ret = amdxdna_hal_hwctx_init(ctx);
 	if (ret) {
 		XDNA_ERR(xdna, "Init ctx failed, ret %d", ret);
 		goto free_name;
@@ -516,8 +520,10 @@ int amdxdna_cmd_submit(struct amdxdna_client *client, u32 opcode,
 	}
 	job->state = JOB_STATE_INIT;
 
-	ret = xdna->dev_info->ops->cmd_submit(job, syncobj_hdls,
-					      syncobj_points, syncobj_cnt, seq);
+	/* HAL layer integration: Route through HAL instead of direct ops call */
+	/* Execution flow: Command Submit */
+	ret = amdxdna_hal_cmd_submit_job(job, syncobj_hdls,
+					 syncobj_points, syncobj_cnt, seq);
 	if (ret) {
 		if (ret != -ERESTARTSYS)
 			XDNA_ERR(xdna, "Submit cmds failed, ret %d", ret);
@@ -771,7 +777,9 @@ int amdxdna_cmd_wait(struct amdxdna_client *client, u32 ctx_hdl,
 		goto unlock_ctx_srcu;
 	}
 
-	ret = xdna->dev_info->ops->cmd_wait(ctx, seq, timeout);
+	/* HAL layer integration: Route through HAL instead of direct ops call */
+	/* Execution flow: Command Wait */
+	ret = amdxdna_hal_cmd_wait_ctx(ctx, seq, timeout);
 
 unlock_ctx_srcu:
 	srcu_read_unlock(&client->ctx_srcu, idx);

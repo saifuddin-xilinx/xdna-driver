@@ -17,6 +17,7 @@
 #include <drm/drm_managed.h>
 
 #include "amdxdna_drm.h"
+#include "amdxdna_hal_drv.h"
 
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("AMD XDNA HAL - Auxiliary bus driver binding (prototype)");
@@ -37,44 +38,40 @@ static int amdxdna_aux_probe(struct auxiliary_device *adev,
 {
 	struct device *dev = &adev->dev;
 	struct amdxdna_dev *xdna;
+	const struct amdxdna_hal *hal;
 
-	/* Allocate DRM device (common framework) */
-	xdna = devm_drm_dev_alloc(dev, &amdxdna_drm_drv, typeof(*xdna), ddev);
+	/* Execution flow: Device Init */
+	/* Kernel binds accel-vdev → amdxdna_aux_probe() */
+
+	/* Determine which HAL to use (VE2 for auxiliary bus) */
+	hal = &amdxdna_hal_ve2;
+
+	/* Call HAL device probe */
+	/* amdxdna_hal_dev_probe(dev, hal) */
+	xdna = amdxdna_hal_dev_probe(dev, hal);
 	if (IS_ERR(xdna))
 		return PTR_ERR(xdna);
 
-	/* Stub: would probe auxiliary device and register with HAL framework */
-	/* Real implementation would continue with:
-	 *   - Get device info from id->data: xdna->dev_info = (struct amdxdna_dev_info *)id->data
-	 *   - Initialize device lock and client list
-	 *   - Call dev_info->ops->init()
-	 *   - Set vbnv to default
-	 *   - Register DRM device: drm_dev_register(&xdna->ddev, 0)
-	 *   - Configure DMA mask
-	 *   - Initialize debugfs
-	 *   - Set IOMMU mode
-	 */
-	(void)adev;
-	(void)id;
-	return -ENODEV;
+	/* Store device in auxiliary device data */
+	/* Real: auxiliary_set_drvdata(adev, xdna) */
+	auxiliary_set_drvdata(adev, xdna);
+
+	/* Device ready */
+	return 0;
 }
 
 static void amdxdna_aux_remove(struct auxiliary_device *adev)
 {
 	struct amdxdna_dev *xdna = auxiliary_get_drvdata(adev);
 
-	/* Unregister DRM device (common framework) */
-	/* Real: drm_dev_unplug(&xdna->ddev); */
-	/* Stub: would unregister DRM device */
+	/* Execution flow: Device Fini */
+	/* amdxdna_aux_remove() */
 
-	/* Stub: would remove auxiliary device from HAL framework */
-	/* Real implementation:
-	 *   - Unregister DRM device: drm_dev_unplug(&xdna->ddev)
-	 *   - Call dev_info->ops->fini()
-	 *   - Clean up device resources
-	 */
-	(void)xdna;
-	(void)adev;
+	/* Call HAL device remove */
+	/* amdxdna_hal_dev_remove(xdna) */
+	amdxdna_hal_dev_remove(xdna);
+
+	/* Device gone */
 }
 
 static struct auxiliary_driver amdxdna_aux_driver = {

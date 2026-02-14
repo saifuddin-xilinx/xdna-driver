@@ -17,6 +17,7 @@
 
 #include "amdxdna_pci_drv.h"
 #include "amdxdna_drm.h"
+#include "amdxdna_hal_drv.h"
 
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("AMD XDNA HAL - PCI bus driver binding (prototype)");
@@ -71,42 +72,42 @@ static int amdxdna_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 {
 	struct device *dev = &pdev->dev;
 	struct amdxdna_dev *xdna;
+	const struct amdxdna_hal *hal;
 
-	/* Allocate DRM device (common framework) */
-	xdna = devm_drm_dev_alloc(dev, &amdxdna_drm_drv, typeof(*xdna), ddev);
+	/* Execution flow: Device Init */
+	/* Kernel binds PCI device → aie2_pci_probe() / aie4_pci_probe() */
+
+	/* Determine which HAL to use based on PCI device ID */
+	/* Real: hal = amdxdna_get_hal_for_pci(pdev) */
+	/* Prototype: Select HAL based on device (AIE2 or AIE4) */
+	hal = &amdxdna_hal_aie2; /* Prototype: default to AIE2, real would detect */
+
+	/* Call HAL device probe */
+	/* amdxdna_hal_dev_probe(dev, hal) */
+	xdna = amdxdna_hal_dev_probe(dev, hal);
 	if (IS_ERR(xdna))
 		return PTR_ERR(xdna);
 
-	/* Stub: would probe PCI device and register with HAL framework */
-	/* Real implementation would continue with:
-	 *   - Get device info: xdna->dev_info = amdxdna_get_dev_info(pdev)
-	 *   - Initialize IOMMU: amdxdna_iommu_init(xdna)
-	 *   - Initialize hardware via dev_info->ops->init()
-	 *   - Register DRM device: drm_dev_register(&xdna->ddev, 0)
-	 *   - Initialize DPT, sysfs, debugfs
-	 */
-	(void)pdev;
-	(void)id;
-	return -ENODEV;
+	/* Store device in PCI device data */
+	/* Real: pci_set_drvdata(pdev, xdna) */
+	pci_set_drvdata(pdev, xdna);
+
+	/* Device ready */
+	return 0;
 }
 
 static void amdxdna_remove(struct pci_dev *pdev)
 {
 	struct amdxdna_dev *xdna = pci_get_drvdata(pdev);
 
-	/* Unregister DRM device (common framework) */
-	/* Real: drm_dev_unplug(&xdna->ddev); */
-	/* Stub: would unregister DRM device */
+	/* Execution flow: Device Fini */
+	/* aie2_pci_remove() / aie4_pci_remove() */
 
-	/* Stub: would remove PCI device from HAL framework */
-	/* Real implementation:
-	 *   - Unregister DRM device: drm_dev_unplug(&xdna->ddev)
-	 *   - Clean up clients and contexts
-	 *   - Call dev_info->ops->fini()
-	 *   - Clean up IOMMU, workqueues, etc.
-	 */
-	(void)xdna;
-	(void)pdev;
+	/* Call HAL device remove */
+	/* amdxdna_hal_dev_remove(xdna) */
+	amdxdna_hal_dev_remove(xdna);
+
+	/* Device gone */
 }
 
 static pci_ers_result_t amdxdna_error_detected(struct pci_dev *pdev,
