@@ -611,10 +611,8 @@ static const struct drm_sched_backend_ops sched_ops = {
 static int aie2_hwctx_col_list(struct amdxdna_hwctx *hwctx)
 {
 	struct amdxdna_dev *xdna = hwctx->client->xdna;
-	struct amdxdna_dev_hdl *ndev;
-	int start, end, first, last;
-	u32 width = 1, entries = 0;
-	int i;
+	struct amdxdna_dev_hdl *ndev = xdna->dev_handle;
+	bool natural_align;
 
 	if (!hwctx->num_tiles) {
 		XDNA_ERR(xdna, "Number of tiles is zero");
@@ -727,38 +725,7 @@ static void aie2_release_resource(struct amdxdna_hwctx *hwctx)
 
 static int aie2_ctx_syncobj_create(struct amdxdna_hwctx *hwctx)
 {
-	struct amdxdna_dev *xdna = hwctx->client->xdna;
-	struct drm_file *filp = hwctx->client->filp;
-	struct drm_syncobj *syncobj;
-	u32 hdl;
-	int ret;
-
-	hwctx->syncobj_hdl = AMDXDNA_INVALID_FENCE_HANDLE;
-
-	ret = drm_syncobj_create(&syncobj, 0, NULL);
-	if (ret) {
-		XDNA_ERR(xdna, "Create ctx syncobj failed, ret %d", ret);
-		return ret;
-	}
-	ret = drm_syncobj_get_handle(filp, syncobj, &hdl);
-	if (ret) {
-		drm_syncobj_put(syncobj);
-		XDNA_ERR(xdna, "Create ctx syncobj handle failed, ret %d", ret);
-		return ret;
-	}
-	hwctx->priv->syncobj = syncobj;
-	hwctx->syncobj_hdl = hdl;
-
-	return 0;
-}
-
-static void aie2_ctx_syncobj_destroy(struct amdxdna_hwctx *hwctx)
-{
-	/*
-	 * The syncobj_hdl is owned by user space and will be cleaned up
-	 * separately.
-	 */
-	drm_syncobj_put(hwctx->priv->syncobj);
+	return amdxdna_ctx_syncobj_create(hwctx);
 }
 
 int aie2_hwctx_init(struct amdxdna_hwctx *hwctx)
@@ -829,8 +796,8 @@ int aie2_hwctx_init(struct amdxdna_hwctx *hwctx)
 			     NULL, NULL, "amdxdna_js", xdna->ddev.dev);
 #endif
 	if (ret) {
-		XDNA_ERR(xdna, "Failed to init DRM scheduler. ret %d", ret);
-		goto free_cmd_bufs;
+		XDNA_ERR(xdna, "Initialize hwctx priv failed, ret %d", ret);
+		goto unpin_heap;
 	}
 
 	ret = drm_sched_entity_init(&priv->entity, DRM_SCHED_PRIORITY_NORMAL,
@@ -843,7 +810,7 @@ int aie2_hwctx_init(struct amdxdna_hwctx *hwctx)
 	ret = aie2_hwctx_col_list(hwctx);
 	if (ret) {
 		XDNA_ERR(xdna, "Create col list failed, ret %d", ret);
-		goto free_entity;
+		goto fini_priv;
 	}
 
 	ret = amdxdna_pm_resume_get_locked(xdna);
@@ -899,10 +866,7 @@ free_cmd_bufs:
 
 void aie2_hwctx_fini(struct amdxdna_hwctx *hwctx)
 {
-	struct amdxdna_dev *xdna;
-	int idx;
-
-	xdna = hwctx->client->xdna;
+	struct amdxdna_dev *xdna = hwctx->client->xdna;
 
 	XDNA_DBG(xdna, "%s sequence number %lld", hwctx->name, hwctx->priv->seq);
 	aie2_hwctx_wait_for_idle(hwctx);

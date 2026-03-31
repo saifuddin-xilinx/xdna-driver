@@ -3,6 +3,7 @@
  * Copyright (C) 2022-2026, Advanced Micro Devices, Inc.
  */
 
+#include "config_kernel.h"
 #include "drm/amdxdna_accel.h"
 #include <drm/drm_device.h>
 #include <drm/drm_drv.h>
@@ -10,6 +11,7 @@
 #include <drm/drm_gem.h>
 #include <drm/drm_gem_shmem_helper.h>
 #include <drm/drm_print.h>
+#include <drm/drm_syncobj.h>
 #include <drm/gpu_scheduler.h>
 #include <linux/xarray.h>
 #include "trace/events/amdxdna.h"
