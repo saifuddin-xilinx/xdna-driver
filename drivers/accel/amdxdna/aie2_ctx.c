@@ -27,9 +27,10 @@ static bool force_cmdlist = true;
 module_param(force_cmdlist, bool, 0600);
 MODULE_PARM_DESC(force_cmdlist, "Force use command list (Default true)");
 
-uint tdr_timeout_ms = 2000;
-module_param(tdr_timeout_ms, uint, 0400);
-MODULE_PARM_DESC(tdr_timeout_ms, "TDR (Timeout Detection and Recovery) timeout in milliseconds (0 = disable)");
+#define TDR_TIMEOUT_MS 2000
+int tdr_timeout_ms = TDR_TIMEOUT_MS;
+module_param(tdr_timeout_ms, int, 0400);
+MODULE_PARM_DESC(tdr_timeout_ms, "TDR (Timeout Detection and Recovery) timeout in milliseconds (0 or negative = disable)");
 
 bool tdr_dump_only;
 module_param(tdr_dump_only, bool, 0600);
@@ -47,7 +48,7 @@ struct aie2_ctx_health {
 
 static inline void aie2_tdr_signal(struct amdxdna_dev *xdna)
 {
-	WRITE_ONCE(xdna->dev_handle->tdr_status, AIE2_TDR_SIGNALED);
+	WRITE_ONCE(xdna->dev_handle->tdr.status, AIE2_TDR_SIGNALED);
 }
 
 #ifdef HAVE_6_17_drm_gpu_sched_stat_no_hang
@@ -55,12 +56,12 @@ static bool aie2_tdr_detect(struct amdxdna_dev *xdna)
 {
 	struct amdxdna_dev_hdl *ndev = xdna->dev_handle;
 
-	if (READ_ONCE(ndev->tdr_status) == AIE2_TDR_WAIT) {
+	if (READ_ONCE(ndev->tdr.status) == AIE2_TDR_WAIT) {
 		XDNA_ERR(xdna, "TDR timeout detected");
 		return true;
 	}
 
-	WRITE_ONCE(ndev->tdr_status, AIE2_TDR_WAIT);
+	WRITE_ONCE(ndev->tdr.status, AIE2_TDR_WAIT);
 	return false;
 }
 #endif
@@ -70,6 +71,7 @@ static void aie2_job_release(struct kref *ref)
 	struct amdxdna_sched_job *job;
 
 	job = container_of(ref, struct amdxdna_sched_job, refcnt);
+
 	amdxdna_sched_job_cleanup(job);
 	atomic64_inc(&job->hwctx->job_free_cnt);
 	wake_up(&job->hwctx->priv->job_free_wq);
@@ -99,108 +101,9 @@ static void aie2_hwctx_stop(struct amdxdna_dev *xdna, struct amdxdna_hwctx *hwct
 #endif
 }
 
-/*
- * Drop pin + ref on every heap chunk this hwctx previously pinned via
- * aie2_hwctx_heap_expand(). Acquires client->mm_lock internally to
- * serialize the walk against concurrent chunk additions; callers must
- * NOT hold mm_lock. Unlike aie2_hwctx_{renotify,heap_expand}_heap()
- * (which are paired under a single mm_lock acquisition in
- * aie2_hwctx_map_heap()), release_heap is always called standalone.
- */
-static void aie2_hwctx_release_heap(struct amdxdna_hwctx *hwctx)
-{
-	struct amdxdna_client *client = hwctx->client;
-	struct amdxdna_gem_obj *last;
-	struct amdxdna_gem_obj *chunk;
-
-	guard(mutex)(&client->mm_lock);
-
-	last = hwctx->priv->last_pinned_chunk;
-	if (!last)
-		return;
-
-	list_for_each_entry(chunk, &client->dev_heap_chunks, heap_chunk_node) {
-		amdxdna_gem_unpin(chunk);
-		drm_gem_object_put(to_gobj(chunk));
-		if (chunk == last)
-			break;
-	}
-	hwctx->priv->last_pinned_chunk = NULL;
-}
-
-static int aie2_hwctx_renotify_heap(struct amdxdna_hwctx *hwctx)
-{
-	struct amdxdna_gem_obj *last = hwctx->priv->last_pinned_chunk;
-	struct amdxdna_client *client = hwctx->client;
-	struct amdxdna_dev *xdna = client->xdna;
-	struct amdxdna_gem_obj *chunk;
-	bool first = true;
-	u64 addr;
-	int ret;
-
-	drm_WARN_ON(&xdna->ddev, !mutex_is_locked(&client->mm_lock));
-
-	if (!last)
-		return 0;
-
-	list_for_each_entry(chunk, &client->dev_heap_chunks, heap_chunk_node) {
-		addr = amdxdna_obj_dma_addr(chunk);
-		if (first)
-			ret = aie2_map_host_buf(xdna->dev_handle,
-						hwctx->fw_ctx_id,
-						addr, chunk->mem.size);
-		else
-			ret = aie2_add_host_buf(xdna->dev_handle,
-						hwctx->fw_ctx_id,
-						addr, chunk->mem.size);
-		if (ret) {
-			XDNA_ERR(xdna,
-				 "Renotify FW hwctx %s for chunk size 0x%lx failed, ret %d",
-				 hwctx->name, chunk->mem.size, ret);
-			return ret;
-		}
-		first = false;
-		if (chunk == last)
-			break;
-	}
-
-	return 0;
-}
-
-static int aie2_hwctx_map_heap(struct amdxdna_hwctx *hwctx)
-{
-	struct amdxdna_client *client = hwctx->client;
-	struct amdxdna_dev *xdna = client->xdna;
-	int ret;
-
-	drm_WARN_ON(&xdna->ddev, !mutex_is_locked(&xdna->dev_lock));
-
-	/*
-	 * Called from hwctx create and from restart (suspend/resume and TDR).
-	 * The per-hwctx FW context is brand-new on both paths and has no
-	 * host_buf state, so on restart we must first re-notify FW for every
-	 * chunk that this hwctx previously pinned (kernel pins/refs are
-	 * preserved across restart). aie2_hwctx_heap_expand() then continues
-	 * from list_prepare_entry(last_pinned_chunk), pinning + notifying any
-	 * chunks added since.
-	 *
-	 * On hwctx create last_pinned_chunk is NULL: renotify is a no-op and
-	 * expand walks from the list head with first_pin = true, issuing
-	 * aie2_map_host_buf() for chunk 0 and aie2_add_host_buf() afterward.
-	 */
-	mutex_lock(&client->mm_lock);
-	ret = aie2_hwctx_renotify_heap(hwctx);
-	if (ret)
-		goto unlock;
-	ret = aie2_hwctx_heap_expand(hwctx);
-unlock:
-	mutex_unlock(&client->mm_lock);
-
-	return ret;
-}
-
 static int aie2_hwctx_restart(struct amdxdna_dev *xdna, struct amdxdna_hwctx *hwctx)
 {
+	struct amdxdna_gem_obj *heap = hwctx->priv->heap;
 	int ret;
 
 	ret = aie2_create_context(xdna->dev_handle, hwctx);
@@ -209,7 +112,9 @@ static int aie2_hwctx_restart(struct amdxdna_dev *xdna, struct amdxdna_hwctx *hw
 		goto out;
 	}
 
-	ret = aie2_hwctx_map_heap(hwctx);
+	ret = aie2_map_host_buf(xdna->dev_handle, hwctx->fw_ctx_id,
+				amdxdna_obj_dma_addr(heap),
+				heap->mem.size);
 	if (ret) {
 		XDNA_ERR(xdna, "Map host buf failed, ret %d", ret);
 		goto out;
@@ -375,7 +280,6 @@ aie2_sched_resp_handler(void *handle, void __iomem *data, size_t size)
 	int ret = 0;
 	u32 status;
 
-	amdxdna_io_stats_job_done(job->hwctx->client);
 	cmd_abo = job->cmd_bo;
 
 	if (unlikely(job->job_timeout)) {
@@ -434,7 +338,6 @@ aie2_sched_cmdlist_resp_handler(void *handle, void __iomem *data, size_t size)
 	u32 cmd_status;
 	int ret = 0;
 
-	amdxdna_io_stats_job_done(job->hwctx->client);
 	cmd_abo = job->cmd_bo;
 
 	if (unlikely(job->job_timeout)) {
@@ -502,6 +405,7 @@ aie2_sched_job_run(struct drm_sched_job *sched_job)
 			ret = aie2_sync_bo(hwctx, job, aie2_sched_drvcmd_resp_handler);
 			break;
 		case ATTACH_DEBUG_BO:
+			fallthrough;
 		case DETACH_DEBUG_BO:
 			ret = aie2_config_debug_bo(hwctx, job, aie2_sched_drvcmd_resp_handler);
 			break;
@@ -529,7 +433,6 @@ out:
 		fence = ERR_PTR(ret);
 	} else {
 		aie2_tdr_signal(hwctx->client->xdna);
-		amdxdna_io_stats_job_start(job->hwctx->client);
 	}
 	trace_xdna_job(sched_job, hwctx->name, "sent to device",
 		       job->seq, job->drv_cmd ? job->drv_cmd->opcode : DEFAULT_IO);
@@ -556,8 +459,8 @@ aie2_sched_job_timedout(struct drm_sched_job *sched_job)
 {
 	struct amdxdna_sched_job *job = drm_job_to_xdna_job(sched_job);
 	struct amdxdna_hwctx *hwctx = job->hwctx;
-	struct app_health_report *report;
 	struct amdxdna_dev *xdna;
+	struct app_health_report *report = NULL;
 	int ret;
 
 	xdna = hwctx->client->xdna;
@@ -611,108 +514,25 @@ static const struct drm_sched_backend_ops sched_ops = {
 static int aie2_hwctx_col_list(struct amdxdna_hwctx *hwctx)
 {
 	struct amdxdna_dev *xdna = hwctx->client->xdna;
-	struct amdxdna_dev_hdl *ndev;
-	int start, end, first, last;
-	u32 width = 1, entries = 0;
-	int i;
+	struct amdxdna_dev_hdl *ndev = xdna->dev_handle;
+	bool natural_align;
 
-	if (!hwctx->num_tiles) {
-		XDNA_ERR(xdna, "Number of tiles is zero");
-		return -EINVAL;
-	}
-
-	ndev = xdna->dev_handle;
-	if (unlikely(!ndev->aie.metadata.core.row_count)) {
-		XDNA_WARN(xdna, "Core tile row count is zero");
-		return -EINVAL;
-	}
-
-	hwctx->num_col = hwctx->num_tiles / ndev->aie.metadata.core.row_count;
-	if (!hwctx->num_col || hwctx->num_col > ndev->total_col) {
-		XDNA_ERR(xdna, "Invalid num_col %d", hwctx->num_col);
-		return -EINVAL;
-	}
-
-	if (ndev->priv->col_align == COL_ALIGN_NATURE)
-		width = hwctx->num_col;
-
-	/*
-	 * In range [start, end], find out columns that is multiple of width.
-	 *	'first' is the first column,
-	 *	'last' is the last column,
-	 *	'entries' is the total number of columns.
-	 */
-	start =  xdna->dev_info->first_col;
-	end =  ndev->total_col - hwctx->num_col;
-	if (start > 0 && end == 0) {
-		XDNA_DBG(xdna, "Force start from col 0");
-		start = 0;
-	}
-	first = start + (width - start % width) % width;
-	last = end - end % width;
-	if (last >= first)
-		entries = (last - first) / width + 1;
-	XDNA_DBG(xdna, "start %d end %d first %d last %d",
-		 start, end, first, last);
-
-	if (unlikely(!entries)) {
-		XDNA_ERR(xdna, "Start %d end %d width %d",
-			 start, end, width);
-		return -EINVAL;
-	}
-
-	hwctx->col_list = kmalloc_objs(*hwctx->col_list, entries);
-	if (!hwctx->col_list)
-		return -ENOMEM;
-
-	hwctx->col_list_len = entries;
-	hwctx->col_list[0] = first;
-	for (i = 1; i < entries; i++)
-		hwctx->col_list[i] = hwctx->col_list[i - 1] + width;
-
-	print_hex_dump_debug("col_list: ", DUMP_PREFIX_OFFSET, 16, 4, hwctx->col_list,
-			     entries * sizeof(*hwctx->col_list), false);
-	return 0;
+	natural_align = (ndev->priv->col_align == COL_ALIGN_NATURE);
+	return amdxdna_hwctx_col_list(hwctx, ndev->metadata.core.row_count,
+				      ndev->total_col, natural_align);
 }
 
 static int aie2_alloc_resource(struct amdxdna_hwctx *hwctx)
 {
 	struct amdxdna_dev *xdna = hwctx->client->xdna;
-	struct alloc_requests *xrs_req;
-	u32 temporal_only_col = 0;
-	int ret;
-
-	xrs_req = kzalloc_obj(*xrs_req);
-	if (!xrs_req)
-		return -ENOMEM;
 
 	if (AIE_FEATURE_ON(&xdna->dev_handle->aie, AIE2_TEMPORAL_ONLY)) {
-		xrs_req->cdo.start_cols = &temporal_only_col;
-		xrs_req->cdo.cols_len = 1;
-		xrs_req->cdo.ncols = xdna->dev_handle->total_col;
-	} else {
-		xrs_req->cdo.start_cols = hwctx->col_list;
-		xrs_req->cdo.cols_len = hwctx->col_list_len;
-		xrs_req->cdo.ncols = hwctx->num_col;
+		hwctx->num_unused_col = xdna->dev_handle->total_col - hwctx->num_col;
+		hwctx->num_col = xdna->dev_handle->total_col;
+		return aie2_create_context(xdna->dev_handle, hwctx);
 	}
-	/* Use platform opc */
-	xrs_req->cdo.qos_cap.opc = xdna->dev_handle->priv->col_opc * hwctx->num_col;
 
-	xrs_req->rqos.gops = hwctx->qos.gops;
-	xrs_req->rqos.fps = hwctx->qos.fps;
-	xrs_req->rqos.dma_bw = hwctx->qos.dma_bandwidth;
-	xrs_req->rqos.latency = hwctx->qos.latency;
-	xrs_req->rqos.exec_time = hwctx->qos.frame_exec_time;
-	xrs_req->rqos.priority = hwctx->qos.priority;
-
-	xrs_req->rid = (uintptr_t)hwctx;
-
-	ret = xrs_allocate_resource(xdna->xrs_hdl, xrs_req, hwctx);
-	if (ret)
-		XDNA_ERR(xdna, "Allocate AIE resource failed, ret %d", ret);
-
-	kfree(xrs_req);
-	return ret;
+	return amdxdna_alloc_resource(hwctx);
 }
 
 static void aie2_release_resource(struct amdxdna_hwctx *hwctx)
@@ -720,130 +540,58 @@ static void aie2_release_resource(struct amdxdna_hwctx *hwctx)
 	struct amdxdna_dev *xdna = hwctx->client->xdna;
 	int ret;
 
-	ret = xrs_release_resource(xdna->xrs_hdl, (uintptr_t)hwctx);
-	if (ret)
-		XDNA_ERR(xdna, "Release AIE resource failed, ret %d", ret);
+	if (AIE_FEATURE_ON(&xdna->dev_handle->aie, AIE2_TEMPORAL_ONLY)) {
+		ret = aie2_destroy_context(xdna->dev_handle, hwctx);
+		if (ret && ret != -ENODEV)
+			XDNA_ERR(xdna, "Destroy temporal only context failed, ret %d", ret);
+	} else {
+		amdxdna_release_resource(hwctx);
+	}
 }
 
 static int aie2_ctx_syncobj_create(struct amdxdna_hwctx *hwctx)
 {
-	struct amdxdna_dev *xdna = hwctx->client->xdna;
-	struct drm_file *filp = hwctx->client->filp;
-	struct drm_syncobj *syncobj;
-	u32 hdl;
-	int ret;
-
-	hwctx->syncobj_hdl = AMDXDNA_INVALID_FENCE_HANDLE;
-
-	ret = drm_syncobj_create(&syncobj, 0, NULL);
-	if (ret) {
-		XDNA_ERR(xdna, "Create ctx syncobj failed, ret %d", ret);
-		return ret;
-	}
-	ret = drm_syncobj_get_handle(filp, syncobj, &hdl);
-	if (ret) {
-		drm_syncobj_put(syncobj);
-		XDNA_ERR(xdna, "Create ctx syncobj handle failed, ret %d", ret);
-		return ret;
-	}
-	hwctx->priv->syncobj = syncobj;
-	hwctx->syncobj_hdl = hdl;
-
-	return 0;
-}
-
-static void aie2_ctx_syncobj_destroy(struct amdxdna_hwctx *hwctx)
-{
-	/*
-	 * The syncobj_hdl is owned by user space and will be cleaned up
-	 * separately.
-	 */
-	drm_syncobj_put(hwctx->priv->syncobj);
+	return amdxdna_ctx_syncobj_create(hwctx);
 }
 
 int aie2_hwctx_init(struct amdxdna_hwctx *hwctx)
 {
 	struct amdxdna_client *client = hwctx->client;
 	struct amdxdna_dev *xdna = client->xdna;
-#ifdef HAVE_6_15_drm_sched_init
-	unsigned long timeout_jiffies = MAX_SCHEDULE_TIMEOUT;
-
-#ifdef HAVE_6_17_drm_gpu_sched_stat_no_hang
-	if (tdr_timeout_ms > 0)
-		timeout_jiffies = msecs_to_jiffies(tdr_timeout_ms);
-#endif
-	const struct drm_sched_init_args args = {
-		.ops = &sched_ops,
-#ifdef HAVE_drm_sched_init_args_num_rqs
-		.num_rqs = DRM_SCHED_PRIORITY_COUNT,
-#endif
-		.credit_limit = HWCTX_MAX_CMDS,
-		.timeout = timeout_jiffies,
-		.name = "amdxdna_js",
-		.dev = xdna->ddev.dev,
-	};
-#endif
-	struct drm_gpu_scheduler *sched;
 	struct amdxdna_hwctx_priv *priv;
-	int i, ret;
+	struct amdxdna_gem_obj *heap;
+	int ret;
 
-	priv = kzalloc_obj(*hwctx->priv);
-	if (!priv)
-		return -ENOMEM;
-	hwctx->priv = priv;
-
-	sema_init(&priv->job_sem, HWCTX_MAX_CMDS);
-
-	for (i = 0; i < ARRAY_SIZE(priv->cmd_buf); i++) {
-		struct amdxdna_gem_obj *abo;
-		struct amdxdna_drm_create_bo args = {
-			.flags = 0,
-			.type = AMDXDNA_BO_DEV,
-			.vaddr = 0,
-			.size = MAX_CHAIN_CMDBUF_SIZE,
-		};
-
-		abo = amdxdna_drm_create_dev_bo(&xdna->ddev, &args, client->filp);
-		if (IS_ERR(abo)) {
-			XDNA_ERR(xdna, "Create dev bo failed, ret %ld", PTR_ERR(abo));
-			ret = PTR_ERR(abo);
-			goto free_cmd_bufs;
-		}
-
-		XDNA_DBG(xdna, "Command buf %d addr 0x%llx size 0x%lx",
-			 i, amdxdna_gem_dev_addr(abo), abo->mem.size);
-		priv->cmd_buf[i] = abo;
+	mutex_lock(&client->mm_lock);
+	heap = client->dev_heap;
+	if (!heap) {
+		XDNA_ERR(xdna, "The client dev heap object not exist");
+		mutex_unlock(&client->mm_lock);
+		return -ENOENT;
 	}
+	drm_gem_object_get(to_gobj(heap));
+	mutex_unlock(&client->mm_lock);
 
-	sched = &priv->sched;
-	mutex_init(&priv->io_lock);
-
-	fs_reclaim_acquire(GFP_KERNEL);
-	might_lock(&priv->io_lock);
-	fs_reclaim_release(GFP_KERNEL);
-#ifdef HAVE_6_15_drm_sched_init
-	ret = drm_sched_init(sched, &args);
-#else
-	ret = drm_sched_init(sched, &sched_ops, NULL, DRM_SCHED_PRIORITY_COUNT,
-			     HWCTX_MAX_CMDS, 0, MAX_SCHEDULE_TIMEOUT,
-			     NULL, NULL, "amdxdna_js", xdna->ddev.dev);
-#endif
+	ret = amdxdna_gem_pin(heap);
 	if (ret) {
-		XDNA_ERR(xdna, "Failed to init DRM scheduler. ret %d", ret);
-		goto free_cmd_bufs;
+		XDNA_ERR(xdna, "Dev heap pin failed, ret %d", ret);
+		goto put_heap;
 	}
 
-	ret = drm_sched_entity_init(&priv->entity, DRM_SCHED_PRIORITY_NORMAL,
-				    &sched, 1, NULL);
+	ret = amdxdna_hwctx_priv_init(hwctx, &sched_ops,
+				      tdr_timeout_ms > 0 ? tdr_timeout_ms : 0);
 	if (ret) {
-		XDNA_ERR(xdna, "Failed to initial sched entiry. ret %d", ret);
-		goto free_sched;
+		XDNA_ERR(xdna, "Initialize hwctx priv failed, ret %d", ret);
+		goto unpin_heap;
 	}
+
+	priv = hwctx->priv;
+	priv->heap = heap;
 
 	ret = aie2_hwctx_col_list(hwctx);
 	if (ret) {
 		XDNA_ERR(xdna, "Create col list failed, ret %d", ret);
-		goto free_entity;
+		goto fini_priv;
 	}
 
 	ret = amdxdna_pm_resume_get_locked(xdna);
@@ -856,7 +604,9 @@ int aie2_hwctx_init(struct amdxdna_hwctx *hwctx)
 		goto suspend_put;
 	}
 
-	ret = aie2_hwctx_map_heap(hwctx);
+	ret = aie2_map_host_buf(xdna->dev_handle, hwctx->fw_ctx_id,
+				amdxdna_obj_dma_addr(heap),
+				heap->mem.size);
 	if (ret) {
 		XDNA_ERR(xdna, "Map host buffer failed, ret %d", ret);
 		goto release_resource;
@@ -877,67 +627,30 @@ int aie2_hwctx_init(struct amdxdna_hwctx *hwctx)
 
 release_resource:
 	aie2_release_resource(hwctx);
-	aie2_hwctx_release_heap(hwctx);
 suspend_put:
 	amdxdna_pm_suspend_put(xdna);
 free_col_list:
 	kfree(hwctx->col_list);
-free_entity:
-	drm_sched_entity_destroy(&priv->entity);
-free_sched:
-	drm_sched_fini(&priv->sched);
-free_cmd_bufs:
-	for (i = 0; i < ARRAY_SIZE(priv->cmd_buf); i++) {
-		if (!priv->cmd_buf[i])
-			continue;
-		drm_gem_object_put(to_gobj(priv->cmd_buf[i]));
-	}
-
-	kfree(priv);
+fini_priv:
+	amdxdna_hwctx_priv_fini(hwctx);
+unpin_heap:
+	amdxdna_gem_unpin(heap);
+put_heap:
+	drm_gem_object_put(to_gobj(heap));
 	return ret;
 }
 
 void aie2_hwctx_fini(struct amdxdna_hwctx *hwctx)
 {
-	struct amdxdna_dev *xdna;
-	int idx;
-
-	xdna = hwctx->client->xdna;
+	struct amdxdna_dev *xdna = hwctx->client->xdna;
 
 	XDNA_DBG(xdna, "%s sequence number %lld", hwctx->name, hwctx->priv->seq);
 	aie2_hwctx_wait_for_idle(hwctx);
 
-	/* Request fw to destroy hwctx and cancel the rest pending requests */
-	drm_sched_stop(&hwctx->priv->sched, NULL);
-	aie2_release_resource(hwctx);
+	amdxdna_hwctx_fini(hwctx, aie2_release_resource);
 
-	aie2_hwctx_release_heap(hwctx);
-#ifdef HAVE_6_13_drm_sched_start_errno
-	drm_sched_start(&hwctx->priv->sched, 0);
-#elif defined(HAVE_6_10_drm_sched_start_full_recovery)
-	drm_sched_start(&hwctx->priv->sched, true);
-#else
-	drm_sched_start(&hwctx->priv->sched);
-#endif
-
-	mutex_unlock(&xdna->dev_lock);
-	drm_sched_entity_destroy(&hwctx->priv->entity);
-
-	/* Wait for all submitted jobs to be completed or canceled */
-	wait_event(hwctx->priv->job_free_wq,
-		   atomic64_read(&hwctx->job_submit_cnt) ==
-		   atomic64_read(&hwctx->job_free_cnt));
-	mutex_lock(&xdna->dev_lock);
-
-	drm_sched_fini(&hwctx->priv->sched);
-	aie2_ctx_syncobj_destroy(hwctx);
-
-	for (idx = 0; idx < ARRAY_SIZE(hwctx->priv->cmd_buf); idx++)
-		drm_gem_object_put(to_gobj(hwctx->priv->cmd_buf[idx]));
-
-	mutex_destroy(&hwctx->priv->io_lock);
-	kfree(hwctx->col_list);
-	kfree(hwctx->priv);
+	amdxdna_gem_unpin(hwctx->priv->heap);
+	drm_gem_object_put(to_gobj(hwctx->priv->heap));
 	kfree(hwctx->cus);
 }
 
@@ -1283,82 +996,6 @@ up_sem:
 	up(&hwctx->priv->job_sem);
 	job->job_done = true;
 	return ret;
-}
-
-int aie2_hwctx_heap_expand(struct amdxdna_hwctx *hwctx)
-{
-	struct amdxdna_client *client = hwctx->client;
-	struct amdxdna_dev *xdna = client->xdna;
-	struct amdxdna_gem_obj *last = hwctx->priv->last_pinned_chunk;
-	bool first_pin = !last;
-	struct amdxdna_gem_obj *chunk;
-	u64 addr;
-	int ret;
-
-	drm_WARN_ON(&xdna->ddev, !mutex_is_locked(&xdna->dev_lock));
-	drm_WARN_ON(&xdna->ddev, !mutex_is_locked(&client->mm_lock));
-
-	/*
-	 * Start at the chunk just after last_pinned_chunk, or at the head
-	 * of the list when nothing has been pinned yet for this hwctx.
-	 * list_prepare_entry() yields a cursor whose .next points to the
-	 * desired starting element, so list_for_each_entry_continue() then
-	 * iterates correctly without a duplicate-entry hazard.
-	 */
-	chunk = list_prepare_entry(last, &client->dev_heap_chunks, heap_chunk_node);
-
-	list_for_each_entry_continue(chunk, &client->dev_heap_chunks,
-				     heap_chunk_node) {
-		/*
-		 * In PASID mode the device address comes from the chunk UVA
-		 * (see amdxdna_obj_dma_addr()), so an un-mmapped chunk has
-		 * no valid address yet and must be skipped; it will be
-		 * picked up by a later expand() once userspace mmaps it.
-		 *
-		 * In non-PASID mode (IOVA / carved-out) the device address
-		 * comes from abo->mem.dma_addr, which is set at chunk open
-		 * time independently of mmap, so FW notification can
-		 * proceed regardless of UVA state.
-		 */
-		if (amdxdna_pasid_on(client) &&
-		    chunk->mem.uva == AMDXDNA_INVALID_ADDR) {
-			XDNA_DBG(xdna,
-				 "hwctx %s: chunk not yet mmapped, deferring FW notify",
-				 hwctx->name);
-			break;
-		}
-
-		ret = amdxdna_gem_pin(chunk);
-		if (ret) {
-			XDNA_ERR(xdna, "Pin chunk for hwctx %s failed, ret %d",
-				 hwctx->name, ret);
-			return ret;
-		}
-		drm_gem_object_get(to_gobj(chunk));
-
-		addr = amdxdna_obj_dma_addr(chunk);
-		if (first_pin)
-			ret = aie2_map_host_buf(xdna->dev_handle,
-						hwctx->fw_ctx_id,
-						addr, chunk->mem.size);
-		else
-			ret = aie2_add_host_buf(xdna->dev_handle,
-						hwctx->fw_ctx_id,
-						addr, chunk->mem.size);
-		if (ret) {
-			XDNA_ERR(xdna,
-				 "Notify FW hwctx %s for chunk size 0x%lx failed, ret %d",
-				 hwctx->name, chunk->mem.size, ret);
-			amdxdna_gem_unpin(chunk);
-			drm_gem_object_put(to_gobj(chunk));
-			return ret;
-		}
-
-		hwctx->priv->last_pinned_chunk = chunk;
-		first_pin = false;
-	}
-
-	return 0;
 }
 
 void aie2_hmm_invalidate(struct amdxdna_gem_obj *abo,
