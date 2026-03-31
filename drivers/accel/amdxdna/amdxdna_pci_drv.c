@@ -438,15 +438,7 @@ static int amdxdna_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	amdxdna_debugfs_init(xdna);
 	return 0;
 
-failed_sysfs_fini:
-	amdxdna_sysfs_fini(xdna);
-failed_dev_fini:
-	mutex_lock(&xdna->dev_lock);
-	xdna->dev_info->ops->fini(xdna);
-	mutex_unlock(&xdna->dev_lock);
-destroy_notifier_wq:
-	destroy_workqueue(xdna->notifier_wq);
-iommu_fini:
+failed_iommu_fini:
 	amdxdna_iommu_fini(xdna);
 	return ret;
 }
@@ -454,26 +446,8 @@ iommu_fini:
 static void amdxdna_remove(struct pci_dev *pdev)
 {
 	struct amdxdna_dev *xdna = pci_get_drvdata(pdev);
-	struct amdxdna_client *client;
 
-	destroy_workqueue(xdna->notifier_wq);
-
-	drm_dev_unplug(&xdna->ddev);
-	amdxdna_sysfs_fini(xdna);
-
-	mutex_lock(&xdna->dev_lock);
-	client = list_first_entry_or_null(&xdna->client_list,
-					  struct amdxdna_client, node);
-	while (client) {
-		amdxdna_client_cleanup(client);
-
-		client = list_first_entry_or_null(&xdna->client_list,
-						  struct amdxdna_client, node);
-	}
-
-	xdna->dev_info->ops->fini(xdna);
-	mutex_unlock(&xdna->dev_lock);
-
+	amdxdna_dev_cleanup(xdna);
 	amdxdna_iommu_fini(xdna);
 }
 
@@ -506,6 +480,6 @@ module_pci_driver(amdxdna_pci_driver);
 
 MODULE_LICENSE("GPL");
 MODULE_IMPORT_NS("AMD_PMF");
-MODULE_AUTHOR("XRT Team <runtimeca39d@amd.com>");
-MODULE_VERSION("0.1");
-MODULE_DESCRIPTION("amdxdna driver");
+MODULE_AUTHOR(AMDXDNA_MODULE_AUTHOR);
+MODULE_VERSION(AMDXDNA_MODULE_VERSION);
+MODULE_DESCRIPTION(AMDXDNA_MODULE_DESCRIPTION);

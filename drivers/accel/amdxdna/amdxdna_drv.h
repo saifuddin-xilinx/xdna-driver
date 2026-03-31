@@ -3,15 +3,11 @@
  * Copyright (C) 2022-2026, Advanced Micro Devices, Inc.
  */
 
-#ifndef _AMDXDNA_PCI_DRV_H_
-#define _AMDXDNA_PCI_DRV_H_
+#ifndef _AMDXDNA_DRV_H_
+#define _AMDXDNA_DRV_H_
 
-#include "drm/amdxdna_accel.h"
 #include <drm/drm_device.h>
-#include <drm/drm_file.h>
 #include <drm/drm_print.h>
-#include <linux/capability.h>
-#include <linux/cred.h>
 #include <linux/iommu.h>
 #include <linux/iova.h>
 #include <linux/workqueue.h>
@@ -45,12 +41,30 @@ extern const struct drm_driver amdxdna_drm_drv;
 
 struct amdxdna_client;
 struct amdxdna_dev;
+struct amdxdna_dev_info;
 struct amdxdna_drm_get_info;
 struct amdxdna_drm_set_state;
+struct amdxdna_drm_get_array;
 struct amdxdna_gem_obj;
 struct amdxdna_hwctx;
 struct amdxdna_sched_job;
-struct amdxdna_msg_buf_hdl;
+
+/*
+ * 0.0: Initial version
+ * 0.1: Support getting all hardware contexts by DRM_IOCTL_AMDXDNA_GET_ARRAY
+ * 0.2: Support getting last error hardware error
+ * 0.3: Support firmware debug buffer
+ * 0.4: Support getting resource information
+ * 0.5: Support getting telemetry data
+ * 0.6: Support preemption
+ */
+#define AMDXDNA_DRIVER_MAJOR            0
+#define AMDXDNA_DRIVER_MINOR            6
+
+#define AMDXDNA_MODULE_LICENSE		"GPL"
+#define AMDXDNA_MODULE_AUTHOR		"XRT Team <runtimeca39d@amd.com>"
+#define AMDXDNA_MODULE_VERSION		"0.1"
+#define AMDXDNA_MODULE_DESCRIPTION	"amdxdna driver"
 
 /*
  * struct amdxdna_dev_ops - Device hardware operation callbacks
@@ -61,47 +75,16 @@ struct amdxdna_dev_ops {
 	int (*resume)(struct amdxdna_dev *xdna);
 	int (*suspend)(struct amdxdna_dev *xdna);
 	int (*sriov_configure)(struct amdxdna_dev *xdna, int num_vfs);
-	int (*mmap)(struct amdxdna_client *client, struct vm_area_struct *vma);
+	const struct drm_sched_backend_ops *sched_ops;
 	int (*hwctx_init)(struct amdxdna_hwctx *hwctx);
 	void (*hwctx_fini)(struct amdxdna_hwctx *hwctx);
 	int (*hwctx_config)(struct amdxdna_hwctx *hwctx, u32 type, u64 value, void *buf, u32 size);
 	int (*hwctx_sync_debug_bo)(struct amdxdna_hwctx *hwctx, u32 debug_bo_hdl);
 	void (*hmm_invalidate)(struct amdxdna_gem_obj *abo, unsigned long cur_seq);
 	int (*cmd_submit)(struct amdxdna_hwctx *hwctx, struct amdxdna_sched_job *job, u64 *seq);
-	int (*cmd_wait)(struct amdxdna_hwctx *hwctx, u64 seq, u32 timeout);
 	int (*get_aie_info)(struct amdxdna_client *client, struct amdxdna_drm_get_info *args);
 	int (*set_aie_state)(struct amdxdna_client *client, struct amdxdna_drm_set_state *args);
 	int (*get_array)(struct amdxdna_client *client, struct amdxdna_drm_get_array *args);
-	int (*get_dev_revision)(struct amdxdna_dev *xdna, u32 *rev);
-	int (*hwctx_heap_expand)(struct amdxdna_hwctx *hwctx);
-};
-
-struct amdxdna_fw_feature_tbl {
-	u64 features;
-	u32 major;
-	u32 max_minor;
-	u32 min_minor;
-};
-
-/* PCI-specific dev_info extensions */
-struct amdxdna_dev_info {
-	int				reg_bar;
-	int				mbox_bar;
-	int				sram_bar;
-	int				psp_bar;
-	int				smu_bar;
-	int				doorbell_bar;
-	int				device_type;
-	int				first_col;
-	u32				dev_mem_buf_shift;
-	u64				dev_mem_base;
-	size_t				dev_mem_size;
-	const char			*default_vbnv;
-	const struct amdxdna_rev_vbnv	*rev_vbnv_tbl;
-	size_t				dev_heap_max_size;
-	const struct amdxdna_dev_priv	*dev_priv;
-	const struct amdxdna_fw_feature_tbl *fw_feature_tbl;
-	const struct amdxdna_dev_ops	*ops;
 };
 
 struct amdxdna_fw_ver {
@@ -110,8 +93,6 @@ struct amdxdna_fw_ver {
 	u32 sub;
 	u32 build;
 };
-
-struct amdxdna_carveout;
 
 struct amdxdna_dev {
 	struct drm_device		ddev;
@@ -128,26 +109,15 @@ struct amdxdna_dev {
 	struct iommu_group		*group;
 	struct iommu_domain		*domain;
 	struct iova_domain		iovad;
-	/* Accurate board name queried from firmware, or default_vbnv as fallback */
-	const char			*vbnv;
-
-	struct amdxdna_carveout		*carveout;
 };
 
 /*
- * struct amdxdna_device_id - PCI device info
+ * struct amdxdna_device_id - device info
  */
 struct amdxdna_device_id {
 	unsigned short device;
 	u8 revision;
 	const struct amdxdna_dev_info *dev_info;
-};
-
-struct amdxdna_io_stats {
-	spinlock_t			lock; /* protect io stats */
-	int				job_depth;
-	u64				start_time;
-	u64				busy_time;
 };
 
 /*
@@ -165,8 +135,6 @@ struct amdxdna_client {
 
 	struct mutex			mm_lock; /* protect memory related */
 	struct amdxdna_gem_obj		*dev_heap;
-	struct list_head		dev_heap_chunks;
-	size_t				total_heap_size;
 
 	struct iommu_sva		*sva;
 	int				pasid;
@@ -175,8 +143,6 @@ struct amdxdna_client {
 	size_t				heap_usage;
 	size_t				total_bo_usage;
 	size_t				total_int_bo_usage;
-
-	struct amdxdna_io_stats		io_stats;
 };
 
 #define amdxdna_for_each_hwctx(client, hwctx_id, entry)		\
@@ -185,25 +151,21 @@ struct amdxdna_client {
 #define amdxdna_for_each_client(xdna, client)			\
 	list_for_each_entry(client, &(xdna)->client_list, node)
 
-/* Add device info below */
-extern const struct amdxdna_dev_info dev_npu1_info;
-extern const struct amdxdna_dev_info dev_npu3_classic_info;
-extern const struct amdxdna_dev_info dev_npu3_pf_info;
-extern const struct amdxdna_dev_info dev_npu3_vf_info;
-extern const struct amdxdna_dev_info dev_npu4_info;
-extern const struct amdxdna_dev_info dev_npu5_info;
-extern const struct amdxdna_dev_info dev_npu6_info;
-
 int amdxdna_sysfs_init(struct amdxdna_dev *xdna);
 void amdxdna_sysfs_fini(struct amdxdna_dev *xdna);
 
+/* Common device initialization and registration */
+int amdxdna_dev_init(struct amdxdna_dev *xdna);
+void amdxdna_dev_cleanup(struct amdxdna_dev *xdna);
+
+/* IOMMU helper functions */
 int amdxdna_iommu_init(struct amdxdna_dev *xdna);
 void amdxdna_iommu_fini(struct amdxdna_dev *xdna);
+int amdxdna_iommu_map_bo(struct amdxdna_dev *xdna, struct amdxdna_gem_obj *abo);
+void amdxdna_iommu_unmap_bo(struct amdxdna_dev *xdna, struct amdxdna_gem_obj *abo);
 void *amdxdna_iommu_alloc(struct amdxdna_dev *xdna, size_t size, dma_addr_t *dma_addr);
 void amdxdna_iommu_free(struct amdxdna_dev *xdna, size_t size,
 			void *cpu_addr, dma_addr_t dma_addr);
-int amdxdna_dma_map_bo(struct amdxdna_dev *xdna, struct amdxdna_gem_obj *abo);
-void amdxdna_dma_unmap_bo(struct amdxdna_dev *xdna, struct amdxdna_gem_obj *abo);
 
 static inline bool amdxdna_iova_on(struct amdxdna_dev *xdna)
 {
@@ -215,10 +177,4 @@ static inline bool amdxdna_pasid_on(struct amdxdna_client *client)
 	return client->pasid != IOMMU_PASID_INVALID;
 }
 
-/* True if the current task may examine @client's contexts. */
-static inline bool amdxdna_client_visible(struct amdxdna_client *client)
-{
-	return capable(CAP_SYS_ADMIN) ||
-	       uid_eq(current_euid(), client->filp->filp->f_cred->euid);
-}
-#endif /* _AMDXDNA_PCI_DRV_H_ */
+#endif /* _AMDXDNA_DRV_H_ */
