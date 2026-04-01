@@ -63,4 +63,5 @@ amdxdna-$(CONFIG_DEBUG_FS) += \
         amdxdna_debugfs.o \
 
 amdxdna-$(OFT_CONFIG_AMDXDNA_AUX) += \
-        amdxdna_aux_drv.o
+        amdxdna_aux_drv.o \
+        ve2_aux.o
