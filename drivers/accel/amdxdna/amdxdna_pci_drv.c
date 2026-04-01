@@ -438,6 +438,8 @@ static int amdxdna_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	amdxdna_debugfs_init(xdna);
 	return 0;
 
+failed_destroy_wq:
+	destroy_workqueue(xdna->notifier_wq);
 failed_iommu_fini:
 	amdxdna_iommu_fini(xdna);
 	return ret;
@@ -448,6 +450,7 @@ static void amdxdna_remove(struct pci_dev *pdev)
 	struct amdxdna_dev *xdna = pci_get_drvdata(pdev);
 
 	amdxdna_dev_cleanup(xdna);
+	destroy_workqueue(xdna->notifier_wq);
 	amdxdna_iommu_fini(xdna);
 }
 
