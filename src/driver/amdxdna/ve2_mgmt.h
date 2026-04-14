@@ -220,33 +220,10 @@ int notify_fw_cmd_ready(struct amdxdna_ctx *hwctx);
 int ve2_xrs_request(struct amdxdna_dev *xdna, struct amdxdna_ctx *hwctx);
 
 /**
- * ve2_mgmt_schedule_cmd - Schedule a command for execution.
- * @xdna: Pointer to the device structure.
- * @hwctx: Pointer to the hardware context.
- * @command_index: read_index value when this job completes (last_slot + 1).
- *                 Used for FIFO ordering; must be job-specific for correct
- *                 completion tracking when multiple threads interleave submissions.
- *
- * Returns 0 on success or a negative error code.
- */
-int ve2_mgmt_schedule_cmd(struct amdxdna_dev *xdna, struct amdxdna_ctx *hwctx,
-			  u64 command_index);
-
-/**
  * ve2_mgmt_handshake_init - Initialize handshake with firmware for a context.
  * @xdna: Pointer to the device structure.
  * @hwctx: Pointer to the hardware context.
  */
 void ve2_mgmt_handshake_init(struct amdxdna_dev *xdna, struct amdxdna_ctx *hwctx);
-
-/**
- * ve2_fifo_remove_ctx - Remove all FIFO entries for a given context.
- * @mgmtctx: Pointer to the management context.
- * @ctx: Pointer to the context to remove.
- *
- * Must be called with mgmtctx->ctx_lock held.
- * This prevents use-after-free when a context is destroyed.
- */
-void ve2_fifo_remove_ctx(struct amdxdna_mgmtctx *mgmtctx, struct amdxdna_ctx *ctx);
 
 #endif /* _VE2_MGMT_H_ */

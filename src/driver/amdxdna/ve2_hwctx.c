@@ -252,7 +252,7 @@ static void ve2_job_release(struct kref *ref)
 	amdxdna_sched_job_cleanup(job);
 }
 
-static void ve2_job_put(struct amdxdna_sched_job *job)
+void ve2_job_put(struct amdxdna_sched_job *job)
 {
 	kref_put(&job->refcnt, ve2_job_release);
 }
@@ -338,7 +338,6 @@ static inline void ve2_hwctx_job_release_locked(struct amdxdna_ctx *hwctx,
 	 */
 	// Reset the pending list
 	priv_ctx->pending[get_job_idx(job->seq)] = NULL;
-	ve2_job_put(job);
 	mutex_unlock(&priv_ctx->privctx_lock);
 }
 
@@ -930,24 +929,37 @@ int ve2_cmd_submit(struct amdxdna_sched_job *job, u32 *syncobj_hdls,
 {
 	struct amdxdna_ctx *hwctx = job->ctx;
 	struct amdxdna_dev *xdna = hwctx->client->xdna;
+	struct amdxdna_ctx_priv *priv = hwctx->priv;
 	struct amdxdna_gem_obj *cmd_bo = job->cmd_bo;
+	u64 slot_id;
 	int ret;
 	u32 op;
 
 	op = amdxdna_cmd_get_op(cmd_bo);
-	XDNA_DBG(xdna, "hwctx %p cmd_submit: op=%u (%s), syncobj_cnt=%u",
-		 hwctx, op, op == ERT_CMD_CHAIN ? "CHAIN" : "SINGLE", syncobj_cnt);
+	XDNA_INFO(xdna, "[TS] cmd_submit ENTRY: hwctx=%p start_col=%u op=%u (%s) syncobj_cnt=%u misc_intrpt=%d",
+		  hwctx, hwctx->start_col, op, op == ERT_CMD_CHAIN ? "CHAIN" : "SINGLE",
+		  syncobj_cnt, priv->misc_intrpt_flag);
 
-	if (hwctx->priv->misc_intrpt_flag) {
-		XDNA_ERR(xdna, "Failed to submit a command, because of misc interrupt\n");
+	if (priv->misc_intrpt_flag) {
+		XDNA_ERR(xdna, "[TS] Failed to submit command - misc interrupt flag set");
 		return -EINVAL;
 	}
 
 	if (op != ERT_START_DPU && op != ERT_CMD_CHAIN) {
-		XDNA_WARN(xdna, "Unsupported ERT cmd: %d received", op);
+		XDNA_WARN(xdna, "[TS] Unsupported ERT cmd: %d received", op);
 		return -EINVAL;
 	}
 
+	/*
+	 * Submit command to HSA queue.
+	 * This must happen before DRM scheduler push because run_job
+	 * expects the command to already be in the HSA queue.
+	 *
+	 * The submit functions will set *seq to the HSA slot_id and
+	 * call ve2_hwctx_add_job to set job->seq and add to pending[].
+	 */
+	XDNA_DBG(xdna, "[TS] Submitting to HSA queue: op=%s",
+		 op == ERT_CMD_CHAIN ? "CHAIN" : "SINGLE");
 	if (op == ERT_CMD_CHAIN)
 		ret = ve2_submit_cmd_chain(hwctx, job, seq);
 	else
@@ -956,18 +968,50 @@ int ve2_cmd_submit(struct amdxdna_sched_job *job, u32 *syncobj_hdls,
 	if (ret) {
 		/* Return -ERESTARTSYS for -EAGAIN so userspace can retry */
 		if (ret == -EAGAIN) {
-			XDNA_ERR(xdna, "Failed to submit a command (retry expected)\n");
+			XDNA_INFO(xdna, "[TS] HSA queue full (retry expected) hwctx=%p", hwctx);
 			return -ERESTARTSYS;
 		}
-
-		XDNA_ERR(xdna, "Failed to submit a command. ret %d\n", ret);
+		XDNA_ERR(xdna, "[TS] Failed to submit to HSA queue: ret=%d hwctx=%p", ret, hwctx);
 		return ret;
 	}
+	slot_id = *seq;
+	XDNA_DBG(xdna, "[TS] HSA queue submission successful: slot_id=%llu", slot_id);
 
-	XDNA_DBG(xdna, "hwctx %p cmd submitted: seq=%llu, total_submitted=%llu",
-		 hwctx, *seq, hwctx->submitted);
-	/* command_index = read_index when this job completes (last_slot + 1) */
-	ve2_mgmt_schedule_cmd(xdna, hwctx, *seq + 1);
+	/*
+	 * Initialize DRM scheduler job.
+	 * Signature: drm_sched_job_init(job, entity, credits, owner)
+	 * credits: number of credits this job consumes (1 for simple jobs)
+	 * owner: owner context for tracking (NULL for now)
+	 */
+	ret = drm_sched_job_init(&job->base, &priv->entity, 1, NULL);
+	if (ret) {
+		XDNA_ERR(xdna, "[TS] DRM job init failed: ret=%d hwctx=%p seq=%llu", ret, hwctx, *seq);
+		return ret;
+	}
+	XDNA_DBG(xdna, "[TS] DRM job initialized: hwctx=%p seq=%llu", hwctx, *seq);
+
+	/*
+	 * Arm job - this creates the scheduler fence (job->base.s_fence->finished).
+	 * The scheduler will call ve2_sched_run_job when ready to execute.
+	 * We will signal job->base.s_fence->finished from IRQ handler on completion.
+	 */
+	/*
+	 * Arm the DRM scheduler job.
+	 * This must be done before pushing to the entity.
+	 */
+	drm_sched_job_arm(&job->base);
+	XDNA_DBG(xdna, "[TS] DRM job armed: hwctx=%p seq=%llu", hwctx, *seq);
+
+	/*
+	 * Set out_fence to the scheduler's finished fence.
+	 * This is what userspace will wait on via syncobj.
+	 * Similar to aie2_ctx.c line 920.
+	 */
+	job->out_fence = dma_fence_get(&job->base.s_fence->finished);
+	XDNA_INFO(xdna, "[TS] Job ready: hwctx=%p seq=%llu slot_id=%llu", hwctx, *seq, slot_id);
+
+	drm_sched_entity_push_job(&job->base);
+	XDNA_INFO(xdna, "[TS] cmd_submit EXIT: hwctx=%p seq=%llu pushed to DRM scheduler", hwctx, *seq);
 
 	return 0;
 }
@@ -1012,69 +1056,69 @@ static inline bool check_read_index(struct amdxdna_ctx *hwctx,
  * the old code wrote through the zero-length uc_info[] embedded inside
  * hwctx->health_data.
  */
-static void ve2_fill_health_data(struct amdxdna_dev *xdna,
-				 struct amdxdna_ctx *hwctx,
-				 void *cmd_data, u32 data_total)
-{
-	struct amdxdna_ctx_priv *priv_ctx = hwctx->priv;
-	struct device *aie_dev = priv_ctx->aie_dev;
-	struct amdxdna_ctx_health_data *health;
-	size_t hdr_size = offsetof(struct amdxdna_ctx_health_data, aie4.uc_info);
-	struct handshake *hs;
-	u32 max_uc;
-	u32 num_uc;
-	int ret;
-
-	if (!cmd_data || data_total < hdr_size) {
-		XDNA_WARN(xdna, "Health data buffer too small: %u < %zu",
-			  data_total, hdr_size);
-		return;
-	}
-
-	memset(cmd_data, 0, data_total);
-	health = (struct amdxdna_ctx_health_data *)cmd_data;
-	health->version = AMDXDNA_CTX_HEALTH_DATA_V1;
-	health->npu_gen = AMDXDNA_NPU_GEN_AIE4;
-	health->aie4.ctx_state = priv_ctx->state;
-	health->aie4.ctx_error_type = 0;
-
-	max_uc = (data_total - hdr_size) / sizeof(struct uc_health_info);
-	num_uc = min(priv_ctx->num_col, max_uc);
-
-	for (u32 col = 0; col < num_uc; col++) {
-		hs = kzalloc(sizeof(*hs), GFP_KERNEL);
-		if (!hs) {
-			XDNA_ERR(xdna, "No memory for handshake\n");
-			return;
-		}
-
-		ret = ve2_partition_read_privileged_mem(aie_dev, col,
-							offsetof(struct handshake,
-								 mpaie_alive),
-							sizeof(struct handshake),
-							(void *)hs);
-		if (ret < 0) {
-			XDNA_ERR(xdna, "aie_partition_read failed col %u ret=%d\n", col, ret);
-			kfree(hs);
-			return;
-		}
-
-		health->aie4.uc_info[col].uc_idx = hwctx->start_col + col;
-		health->aie4.uc_info[col].uc_idle_status = hs->cert_idle_status;
-		health->aie4.uc_info[col].misc_status = hs->misc_status;
-		health->aie4.uc_info[col].fw_state = hs->vm.fw_state;
-		health->aie4.uc_info[col].page_idx = hs->vm.abs_page_index;
-		health->aie4.uc_info[col].offset = hs->vm.ppc;
-		health->aie4.uc_info[col].restore_page = hs->ctx_save.restore_page.page_index;
-		health->aie4.uc_info[col].restore_offset = hs->ctx_save.restore_page.page_offset;
-		health->aie4.uc_info[col].uc_ear = hs->exception.ear;
-		health->aie4.uc_info[col].uc_esr = hs->exception.esr;
-		health->aie4.uc_info[col].uc_pc = hs->exception.pc;
-		kfree(hs);
-	}
-
-	health->aie4.num_uc = num_uc;
-}
+// static void ve2_fill_health_data(struct amdxdna_dev *xdna,
+// 				 struct amdxdna_ctx *hwctx,
+// 				 void *cmd_data, u32 data_total)
+// {
+// 	struct amdxdna_ctx_priv *priv_ctx = hwctx->priv;
+// 	struct device *aie_dev = priv_ctx->aie_dev;
+// 	struct amdxdna_ctx_health_data *health;
+// 	size_t hdr_size = offsetof(struct amdxdna_ctx_health_data, aie4.uc_info);
+// 	struct handshake *hs;
+// 	u32 max_uc;
+// 	u32 num_uc;
+// 	int ret;
+// 
+// 	if (!cmd_data || data_total < hdr_size) {
+// 		XDNA_WARN(xdna, "Health data buffer too small: %u < %zu",
+// 			  data_total, hdr_size);
+// 		return;
+// 	}
+// 
+// 	memset(cmd_data, 0, data_total);
+// 	health = (struct amdxdna_ctx_health_data *)cmd_data;
+// 	health->version = AMDXDNA_CTX_HEALTH_DATA_V1;
+// 	health->npu_gen = AMDXDNA_NPU_GEN_AIE4;
+// 	health->aie4.ctx_state = priv_ctx->state;
+// 	health->aie4.ctx_error_type = 0;
+// 
+// 	max_uc = (data_total - hdr_size) / sizeof(struct uc_health_info);
+// 	num_uc = min(priv_ctx->num_col, max_uc);
+// 
+// 	for (u32 col = 0; col < num_uc; col++) {
+// 		hs = kzalloc(sizeof(*hs), GFP_KERNEL);
+// 		if (!hs) {
+// 			XDNA_ERR(xdna, "No memory for handshake\n");
+// 			return;
+// 		}
+// 
+// 		ret = ve2_partition_read_privileged_mem(aie_dev, col,
+// 							offsetof(struct handshake,
+// 								 mpaie_alive),
+// 							sizeof(struct handshake),
+// 							(void *)hs);
+// 		if (ret < 0) {
+// 			XDNA_ERR(xdna, "aie_partition_read failed col %u ret=%d\n", col, ret);
+// 			kfree(hs);
+// 			return;
+// 		}
+//
+// 		health->aie4.uc_info[col].uc_idx = hwctx->start_col + col;
+// 		health->aie4.uc_info[col].uc_idle_status = hs->cert_idle_status;
+// 		health->aie4.uc_info[col].misc_status = hs->misc_status;
+// 		health->aie4.uc_info[col].fw_state = hs->vm.fw_state;
+// 		health->aie4.uc_info[col].page_idx = hs->vm.abs_page_index;
+// 		health->aie4.uc_info[col].offset = hs->vm.ppc;
+// 		health->aie4.uc_info[col].restore_page = hs->ctx_save.restore_page.page_index;
+// 		health->aie4.uc_info[col].restore_offset = hs->ctx_save.restore_page.page_offset;
+// 		health->aie4.uc_info[col].uc_ear = hs->exception.ear;
+// 		health->aie4.uc_info[col].uc_esr = hs->exception.esr;
+// 		health->aie4.uc_info[col].uc_pc = hs->exception.pc;
+// 		kfree(hs);
+// 	}
+//
+// 	health->aie4.num_uc = num_uc;
+// }
 
 /*
  * Check whether CERT already wrote a terminal completion state to the
@@ -1176,6 +1220,12 @@ static void ve2_process_hqc_completion(struct amdxdna_dev *xdna,
 	}
 }
 
+static void ve2_dump_ctx(struct amdxdna_dev *xdna, struct amdxdna_ctx *hwctx)
+{
+	XDNA_ERR(xdna, "Context error/timeout: hwctx=%p", hwctx);
+	/* Simplified version - detailed health dump omitted */
+}
+
 /*
  * Handle timeout / MISC-interrupt path: collect health data from firmware,
  * set ERT_CMD_STATE_TIMEOUT, and for command chains read runlist_read_idx
@@ -1189,11 +1239,13 @@ static void ve2_handle_timeout(struct amdxdna_dev *xdna,
 	struct amdxdna_ctx_priv *priv_ctx = hwctx->priv;
 	u32 capacity = priv_ctx->hwctx_hsa_queue.hsa_queue_p->hq_header.capacity;
 	struct amdxdna_cmd_chain *cc = NULL;
-	struct amdxdna_gem_obj *target_bo;
 	u32 cmd_count = 1;
 	u32 start_slot = 0;
 	void *cmd_data;
 	u32 data_total;
+	size_t total_size;
+
+	ve2_dump_ctx(xdna, hwctx);
 
 	if (amdxdna_cmd_get_op(job->cmd_bo) == ERT_CMD_CHAIN) {
 		cc = amdxdna_cmd_get_payload(job->cmd_bo, NULL);
@@ -1204,6 +1256,18 @@ static void ve2_handle_timeout(struct amdxdna_dev *xdna,
 		cmd_count = cc->command_count;
 		start_slot = (seq - cmd_count + 1) % capacity;
 	}
+
+	cmd_data = amdxdna_cmd_get_data(job->cmd_bo, &data_total);
+	total_size = sizeof(struct amdxdna_ctx_health_data) +
+		     priv_ctx->num_col * sizeof(struct uc_health_info);
+	if (unlikely(data_total < sizeof(hwctx->health_data)))
+		XDNA_WARN(xdna, "%s: data_total: %u, sizeof(health): %lu",
+			  __func__, data_total, total_size);
+
+	data_total = min(data_total, total_size);
+	memcpy(cmd_data, &hwctx->health_data, total_size);
+	hwctx->health_reported = true;
+	amdxdna_cmd_set_state(job->cmd_bo, ERT_CMD_STATE_TIMEOUT);
 
 	if (cc) {
 		u32 fail_cmd_idx = 0;
@@ -1230,31 +1294,27 @@ static void ve2_handle_timeout(struct amdxdna_dev *xdna,
 			 fail_cmd_idx,
 			 (start_slot + fail_cmd_idx) % capacity,
 			 rl_read_idx);
-
-		/*
-		 * Write health data into the failing sub-command BO so that
-		 * XRT can read it via run.get_ert_packet() on the individual
-		 * run object it exposes in the aie_error exception.
-		 */
-		target_bo = amdxdna_gem_get_obj(hwctx->client,
-						(u32)cc->data[fail_cmd_idx],
-						AMDXDNA_BO_SHARE);
-		if (target_bo) {
-			cmd_data = amdxdna_cmd_get_data(target_bo, &data_total);
-			ve2_fill_health_data(xdna, hwctx, cmd_data, data_total);
-			amdxdna_cmd_set_state(target_bo, ERT_CMD_STATE_TIMEOUT);
-			amdxdna_gem_put_obj(target_bo);
-		} else {
-			XDNA_ERR(xdna, "Failed to find sub-cmd BO %u at chain index %u",
-				 (u32)cc->data[fail_cmd_idx], fail_cmd_idx);
-		}
-	} else {
-		cmd_data = amdxdna_cmd_get_data(job->cmd_bo, &data_total);
-		ve2_fill_health_data(xdna, hwctx, cmd_data, data_total);
 	}
+}
 
-	hwctx->health_reported = true;
-	amdxdna_cmd_set_state(job->cmd_bo, ERT_CMD_STATE_TIMEOUT);
+struct dma_fence *ve2_cmd_get_out_fence(struct amdxdna_ctx *hwctx, u64 seq)
+{
+	struct amdxdna_ctx_priv *priv = hwctx->priv;
+	struct amdxdna_sched_job *job;
+	struct dma_fence *out_fence = NULL;
+	u32 slot_idx = get_job_idx(seq);
+
+	XDNA_INFO(hwctx->client->xdna, "[FENCE] get_out_fence: seq=%llu slot=%u", seq, slot_idx);
+
+	mutex_lock(&priv->privctx_lock);
+	job = priv->pending[slot_idx];
+	if (job && job->seq == seq && job->out_fence) {
+		out_fence = dma_fence_get(job->out_fence);
+		XDNA_INFO(hwctx->client->xdna, "[FENCE] Found out_fence for seq=%llu", seq);
+	}
+	mutex_unlock(&priv->privctx_lock);
+
+	return out_fence;
 }
 
 int ve2_cmd_wait(struct amdxdna_ctx *hwctx, u64 seq, u32 timeout)
@@ -1310,6 +1370,13 @@ int ve2_cmd_wait(struct amdxdna_ctx *hwctx, u64 seq, u32 timeout)
 		} else {
 			ve2_process_hqc_completion(xdna, hwctx, job, seq);
 		}
+
+		/*
+		 * Now signal the fence to notify DRM scheduler that job is complete.
+		 * This must be done AFTER processing completion and setting command state.
+		 */
+		XDNA_INFO(xdna, "[WAIT] Signaling fence for seq=%llu", seq);
+		dma_fence_signal(job->fence);
 
 		ve2_hwctx_job_release_locked(hwctx, job);
 		ve2_job_put(job);
@@ -1380,6 +1447,26 @@ int ve2_hwctx_init(struct amdxdna_ctx *hwctx)
 		goto cleanup_priv;
 	}
 
+	/* Get management context for this partition and setup DRM scheduler entity */
+	{
+		struct amdxdna_mgmtctx *mgmtctx;
+
+		mgmtctx = &xdna->dev_handle->ve2_mgmtctx[hwctx->start_col];
+		priv->sched = &mgmtctx->sched;
+
+		/* Initialize scheduling entity for this hwctx */
+		ret = drm_sched_entity_init(&priv->entity,
+					    DRM_SCHED_PRIORITY_NORMAL,
+					    &priv->sched, 1,	/* One scheduler */
+					    NULL);		/* No guilty context */
+		if (ret) {
+			XDNA_ERR(xdna, "Failed to init sched entity: %d", ret);
+			goto cleanup_xrs;
+		}
+
+		priv->seq = 0;	/* Initialize sequence counter */
+	}
+
 	/* Auto-select memory bitmap based on start_col */
 	ve2_auto_select_mem_bitmap(xdna, hwctx);
 
@@ -1387,7 +1474,7 @@ int ve2_hwctx_init(struct amdxdna_ctx *hwctx)
 	ret = ve2_create_host_queue(xdna, hwctx, &priv->hwctx_hsa_queue);
 	if (ret) {
 		XDNA_ERR(xdna, "Failed to create host queue, ret=%d", ret);
-		goto cleanup_xrs;
+		goto cleanup_entity;
 	}
 
 	if (enable_polling) {
@@ -1410,6 +1497,8 @@ int ve2_hwctx_init(struct amdxdna_ctx *hwctx)
 
 	return 0;
 
+cleanup_entity:
+	drm_sched_entity_destroy(&priv->entity);
 cleanup_xrs:
 	/* Releases XRS and partition (ve2_mgmt_destroy_partition calls ve2_xrs_release). */
 	ve2_mgmt_destroy_partition(hwctx);
@@ -1437,16 +1526,19 @@ void ve2_hwctx_fini(struct amdxdna_ctx *hwctx)
 		del_timer_sync(&hwctx->priv->event_timer);
 
 	/*
-	 * Clear active_ctx FIRST to prevent IRQ handler from queueing new work,
-	 * remove all FIFO entries for this context to prevent use-after-free,
-	 * then cancel any pending work to ensure no work is accessing this context
+	 * Destroy DRM scheduler entity first to stop new job submissions.
+	 * This ensures no new jobs will be pushed to this entity.
+	 */
+	drm_sched_entity_destroy(&nhwctx->entity);
+
+	/*
+	 * Clear active_ctx to prevent IRQ handler from queueing new work,
+	 * then cancel any pending context switch work.
 	 */
 	mgmtctx = &xdna->dev_handle->ve2_mgmtctx[nhwctx->start_col];
 	mutex_lock(&mgmtctx->ctx_lock);
 	if (mgmtctx->active_ctx == hwctx)
 		mgmtctx->active_ctx = NULL;
-	/* Remove all FIFO entries for this context before freeing it */
-	ve2_fifo_remove_ctx(mgmtctx, hwctx);
 	mutex_unlock(&mgmtctx->ctx_lock);
 
 	/* Now cancel any pending work - it will see active_ctx as NULL and bail out */

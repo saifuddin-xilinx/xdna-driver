@@ -23,6 +23,319 @@ static int ve2_create_mgmt_partition(struct amdxdna_dev *xdna,
 				     struct amdxdna_ctx *hwctx,
 				     struct xrs_action_load *load_act);
 
+/* Forward declarations for DRM scheduler */
+static int ve2_perform_context_switch(struct amdxdna_mgmtctx *mgmtctx,
+				       struct amdxdna_ctx *new_hwctx);
+static void ve2_dump_debug_state(struct amdxdna_dev *xdna,
+				 struct amdxdna_mgmtctx *mgmtctx);
+static int ve2_request_context_switch(struct amdxdna_dev *xdna,
+				       struct amdxdna_mgmtctx *mgmtctx);
+static bool ve2_check_context_req(struct amdxdna_mgmtctx *mgmtctx);
+static bool ve2_check_idle(struct amdxdna_mgmtctx *mgmtctx);
+static bool ve2_check_queue_not_empty(struct amdxdna_mgmtctx *mgmtctx);
+
+/*
+ * ===========================================================================
+ * DRM Scheduler Callbacks
+ * ===========================================================================
+ */
+
+/**
+ * ve2_sched_run_job - Execute a job on the hardware
+ * @sched_job: DRM scheduler job to execute
+ *
+ * Called by DRM scheduler when a job should be submitted to HW.
+ * Handles context switching if the job's context is different from
+ * the currently active context on the partition.
+ *
+ * Return: Fence for job completion tracking
+ */
+static struct dma_fence *ve2_sched_run_job(struct drm_sched_job *sched_job)
+{
+	struct amdxdna_sched_job *job = drm_job_to_xdna_job(sched_job);
+	struct amdxdna_ctx *hwctx = job->ctx;
+	struct amdxdna_dev *xdna = hwctx->client->xdna;
+	struct amdxdna_mgmtctx *mgmtctx;
+	struct dma_fence *fence;
+	int ret = 0;
+
+	mgmtctx = &xdna->dev_handle->ve2_mgmtctx[hwctx->start_col];
+	/*
+	 * Get reference to our completion fence.
+	 * The scheduler will wait on this fence. When we signal it (in IRQ handler),
+	 * the scheduler knows the job is complete.
+	 */
+	fence = dma_fence_get(job->fence);
+
+	XDNA_INFO(xdna, "[TS] DRM sched run_job ENTRY: hwctx=%p start_col=%u seq=%llu active_ctx=%p partition_idle=%u idle_due_to_ctx=%u",
+		  hwctx, hwctx->start_col, job->seq, mgmtctx->active_ctx,
+		  mgmtctx->is_partition_idle, mgmtctx->is_idle_due_to_context);
+
+	mutex_lock(&mgmtctx->ctx_lock);
+	XDNA_DBG(xdna, "[TS] Acquired ctx_lock for start_col=%u", hwctx->start_col);
+
+	/* Context switch if needed */
+	if (mgmtctx->active_ctx != hwctx) {
+		XDNA_INFO(xdna, "[TS] Context switch NEEDED: %p → %p (start_col=%u)",
+			  mgmtctx->active_ctx, hwctx, hwctx->start_col);
+		ret = ve2_perform_context_switch(mgmtctx, hwctx);
+		if (ret) {
+			XDNA_ERR(xdna, "[TS] Context switch FAILED: ret=%d start_col=%u", ret, hwctx->start_col);
+			dma_fence_set_error(fence, ret);
+			goto unlock;
+		}
+		XDNA_INFO(xdna, "[TS] Context switch COMPLETED successfully for start_col=%u", hwctx->start_col);
+	} else {
+		XDNA_DBG(xdna, "[TS] No context switch needed - same context %p", hwctx);
+	}
+
+	/*
+	 * Job is already in HSA queue (pushed by ve2_cmd_submit before
+	 * calling drm_sched_entity_push_job). We just need to ensure
+	 * firmware is notified.
+	 */
+	XDNA_DBG(xdna, "[TS] Notifying firmware of command ready for hwctx=%p", hwctx);
+	ret = notify_fw_cmd_ready(hwctx);
+	if (ret < 0)
+		XDNA_ERR(xdna, "[TS] notify_fw_cmd_ready FAILED: ret=%d", ret);
+	else
+		ret = 0; /* Success - normalize return value */
+
+unlock:
+	mutex_unlock(&mgmtctx->ctx_lock);
+	XDNA_INFO(xdna, "[TS] DRM sched run_job EXIT: hwctx=%p seq=%llu ret=%d",
+		  hwctx, job->seq, ret);
+	return fence;
+}
+
+/**
+ * ve2_sched_free_job - Free job resources
+ * @sched_job: DRM scheduler job to free
+ *
+ * Called by DRM scheduler after job completion or cancellation.
+ */
+static void ve2_sched_free_job(struct drm_sched_job *sched_job)
+{
+	struct amdxdna_sched_job *job = drm_job_to_xdna_job(sched_job);
+	struct amdxdna_ctx *hwctx = job->ctx;
+	struct amdxdna_dev *xdna = hwctx->client->xdna;
+
+	XDNA_INFO(xdna, "[TS] DRM sched free_job: hwctx=%p start_col=%u seq=%llu",
+		  hwctx, hwctx->start_col, job->seq);
+
+	/*
+	 * Only cleanup scheduler state here.
+	 * job->fence, job->out_fence, and job itself are released by
+	 * amdxdna_sched_job_cleanup() which is called from the common job
+	 * release path (ve2_job_put -> amdxdna_job_release).
+	 */
+	drm_sched_job_cleanup(sched_job);
+
+	/* Release job reference - may trigger amdxdna_sched_job_cleanup if last ref */
+	ve2_job_put(job);
+
+	XDNA_DBG(xdna, "[TS] DRM sched free_job complete: seq=%llu", job->seq);
+}
+
+/**
+ * ve2_sched_job_timedout - Handle job timeout
+ * @sched_job: DRM scheduler job that timed out
+ *
+ * Called by DRM scheduler when a job exceeds its timeout.
+ * Dumps debug state and initiates recovery.
+ *
+ * Return: DRM_GPU_SCHED_STAT_ENODEV to reset the device
+ */
+static enum drm_gpu_sched_stat ve2_sched_job_timedout(struct drm_sched_job *sched_job)
+{
+	struct amdxdna_sched_job *job = drm_job_to_xdna_job(sched_job);
+	struct amdxdna_ctx *hwctx = job->ctx;
+	struct amdxdna_dev *xdna = hwctx->client->xdna;
+	struct amdxdna_mgmtctx *mgmtctx;
+
+	mgmtctx = &xdna->dev_handle->ve2_mgmtctx[hwctx->start_col];
+
+	XDNA_ERR(xdna, "[TS] !!!TIMEOUT!!! Job timeout detected: hwctx=%p seq=%llu start_col=%u active_ctx=%p",
+		 hwctx, job->seq, hwctx->start_col, mgmtctx->active_ctx);
+
+	XDNA_ERR(xdna, "[TS] TIMEOUT state: partition_idle=%u idle_due_to_ctx=%u is_context_req=%u",
+		 mgmtctx->is_partition_idle, mgmtctx->is_idle_due_to_context, mgmtctx->is_context_req);
+
+	/* Dump debug state */
+	ve2_dump_debug_state(xdna, mgmtctx);
+
+	/*
+	 * Mark context as having a MISC interrupt to prevent further submissions
+	 * This matches the existing timeout behavior
+	 */
+	if (hwctx->priv) {
+		hwctx->priv->misc_intrpt_flag = true;
+		XDNA_ERR(xdna, "[TS] TIMEOUT: Set misc_intrpt_flag for hwctx=%p", hwctx);
+	}
+
+	/*
+	 * Return ENODEV to signal device needs reset.
+	 * DRM scheduler will stop scheduling on this entity.
+	 */
+	XDNA_ERR(xdna, "[TS] TIMEOUT: Returning DRM_GPU_SCHED_STAT_ENODEV - scheduler will stop");
+	return DRM_GPU_SCHED_STAT_ENODEV;
+}
+
+static const struct drm_sched_backend_ops ve2_sched_ops = {
+	.run_job	= ve2_sched_run_job,
+	.free_job	= ve2_sched_free_job,
+	.timedout_job	= ve2_sched_job_timedout,
+};
+
+/*
+ * ===========================================================================
+ * Context Switching
+ * ===========================================================================
+ */
+
+/**
+ * ve2_perform_context_switch - Switch partition to a new context
+ * @mgmtctx: Management context (partition)
+ * @new_hwctx: New hardware context to activate
+ *
+ * Performs firmware handshake to switch the partition from the currently
+ * active context to a new context. Handles three cases:
+ * 1. Partition is idle (no previous context)
+ * 2. Partition idle due to context completion
+ * 3. Active context switch (request from firmware)
+ *
+ * Must be called with mgmtctx->ctx_lock held.
+ *
+ * Return: 0 on success, negative error code on failure
+ */
+static int ve2_perform_context_switch(struct amdxdna_mgmtctx *mgmtctx,
+				       struct amdxdna_ctx *new_hwctx)
+{
+	struct amdxdna_dev *xdna = mgmtctx->xdna;
+	int ret;
+
+	lockdep_assert_held(&mgmtctx->ctx_lock);
+
+	XDNA_INFO(xdna, "[TS] perform_context_switch ENTRY: old_ctx=%p new_ctx=%p start_col=%u partition_idle=%u idle_due_to_context=%u",
+		  mgmtctx->active_ctx, new_hwctx, mgmtctx->start_col,
+		  mgmtctx->is_partition_idle, mgmtctx->is_idle_due_to_context);
+
+	/* Case 1: Partition is idle (no previous context or first activation) */
+	if (mgmtctx->is_partition_idle) {
+		XDNA_INFO(xdna, "[TS] CASE 1: Partition was idle, initializing new context %p start_col=%u",
+			  new_hwctx, mgmtctx->start_col);
+		mgmtctx->is_partition_idle = 0;
+		ve2_mgmt_handshake_init(xdna, new_hwctx);
+		mgmtctx->active_ctx = new_hwctx;
+		XDNA_INFO(xdna, "[TS] CASE 1: Context switch complete - new active_ctx=%p", mgmtctx->active_ctx);
+		return 0;
+	}
+
+	/* Case 2: Partition idle due to context completion */
+	if (mgmtctx->is_idle_due_to_context) {
+		XDNA_INFO(xdna, "[TS] CASE 2: Partition idle due to context completion, switching to %p start_col=%u",
+			  new_hwctx, mgmtctx->start_col);
+		mgmtctx->is_idle_due_to_context = 0;
+		mgmtctx->is_partition_idle = 0;
+		ve2_mgmt_handshake_init(xdna, new_hwctx);
+		mgmtctx->active_ctx = new_hwctx;
+		XDNA_INFO(xdna, "[TS] CASE 2: Context switch complete - new active_ctx=%p", mgmtctx->active_ctx);
+		return 0;
+	}
+
+	/* Case 3: Active context switch - request from firmware */
+	XDNA_INFO(xdna, "[TS] CASE 3: Active context switch from %p to %p start_col=%u - requesting FW switch",
+		  mgmtctx->active_ctx, new_hwctx, mgmtctx->start_col);
+	ret = ve2_request_context_switch(xdna, mgmtctx);
+	if (ret) {
+		XDNA_ERR(xdna, "[TS] CASE 3: ve2_request_context_switch FAILED ret=%d", ret);
+		return ret;
+	}
+	mgmtctx->active_ctx = new_hwctx;
+	ve2_mgmt_handshake_init(xdna, new_hwctx);
+	XDNA_INFO(xdna, "[TS] CASE 3: Active context switch complete - new active_ctx=%p", mgmtctx->active_ctx);
+
+	return 0;
+}
+
+/**
+ * ve2_sched_work - Handle deferred context switch work
+ * @work: Work struct from mgmtctx->sched_work
+ *
+ * Called when firmware signals it's ready for a context switch.
+ * Checks firmware state and allows DRM scheduler to schedule next job.
+ */
+static void ve2_sched_work(struct work_struct *work)
+{
+	struct amdxdna_mgmtctx *mgmtctx =
+		container_of(work, struct amdxdna_mgmtctx, sched_work);
+	struct amdxdna_ctx *hwctx;
+	bool context_req, queue_not_empty, is_idle;
+	u64 read_index = 0;
+
+	XDNA_INFO(mgmtctx->xdna, "[TS] sched_work ENTRY: start_col=%u active_ctx=%p",
+		  mgmtctx->start_col, mgmtctx->active_ctx);
+
+	mutex_lock(&mgmtctx->ctx_lock);
+	XDNA_DBG(mgmtctx->xdna, "[TS] sched_work: acquired ctx_lock");
+
+	/* Check if firmware requested context switch */
+	context_req = ve2_check_context_req(mgmtctx);
+	XDNA_DBG(mgmtctx->xdna, "[TS] sched_work: context_req=%d", context_req);
+
+	queue_not_empty = ve2_check_queue_not_empty(mgmtctx);
+	is_idle = ve2_check_idle(mgmtctx);
+
+	XDNA_INFO(mgmtctx->xdna, "[TS] sched_work: queue_not_empty=%d is_idle=%d partition_idle=%u idle_due_to_ctx=%u",
+		  queue_not_empty, is_idle, mgmtctx->is_partition_idle, mgmtctx->is_idle_due_to_context);
+
+	/*
+	 * Check for job completion (polling-based fallback when IRQ doesn't fire).
+	 * Signal completed jobs by checking pending[] array.
+	 */
+	hwctx = mgmtctx->active_ctx;
+	if (hwctx && hwctx->priv) {
+		/* Get completion index from HSA queue */
+		int ret = get_ctx_read_index(hwctx, &read_index);
+		XDNA_INFO(mgmtctx->xdna, "[TS] sched_work: get_ctx_read_index ret=%d read_idx=%llu", ret, read_index);
+
+		if (!ret) {
+			/* Signal completed jobs with proper locking */
+			/*
+			 * DO NOT signal fences here!
+			 * Let cmd_wait() process completion and signal fence.
+			 */
+			XDNA_INFO(mgmtctx->xdna, "[TS] sched_work: Completed jobs will be processed by cmd_wait()");
+
+			wake_up_interruptible_all(&hwctx->priv->waitq);
+		}
+	} else {
+		XDNA_INFO(mgmtctx->xdna, "[TS] sched_work: hwctx=%p priv=%p (skipping completion check)",
+			  hwctx, hwctx ? hwctx->priv : NULL);
+	}
+
+	if (queue_not_empty || is_idle) {
+		/*
+		 * Partition is ready for context switch.
+		 * DRM scheduler will automatically schedule next job
+		 * from the appropriate entity based on fair scheduling.
+		 */
+		XDNA_INFO(mgmtctx->xdna, "[TS] sched_work: Partition ready for scheduling");
+	} else {
+		XDNA_WARN(mgmtctx->xdna, "[TS] sched_work: Partition NOT ready (queue_empty=%d idle=%d)",
+			  !queue_not_empty, is_idle);
+	}
+
+	mutex_unlock(&mgmtctx->ctx_lock);
+	XDNA_INFO(mgmtctx->xdna, "[TS] sched_work EXIT");
+}
+
+/*
+ * ===========================================================================
+ * Partition Management (Original Functions Below)
+ * ===========================================================================
+ */
+
 static void cert_setup_partition(struct amdxdna_dev *xdna,
 				 struct amdxdna_ctx_priv *nhwctx,
 				 u32 col, struct handshake *cert_hs)
@@ -265,62 +578,6 @@ free_xrs_req:
 	return ret;
 }
 
-// Function to display the queue
-static void ve2_fifo_display_queue(struct amdxdna_mgmtctx *mgmtctx)
-{
-	struct amdxdna_ctx_command_fifo *c_ctx, *t_ctx;
-
-	list_for_each_entry_safe(c_ctx, t_ctx, &mgmtctx->ctx_command_fifo_head, list)
-		XDNA_DBG(mgmtctx->xdna, "CTX : %p command index: %llu\n",
-			 c_ctx->ctx, c_ctx->command_index);
-}
-
-// Enqueue a context into the FIFO queue
-static int ve2_fifo_enqueue(struct amdxdna_mgmtctx *mgmtctx,
-			    struct amdxdna_ctx *ctx, u64 command_index)
-{
-	struct amdxdna_ctx_command_fifo *node;
-
-	node = kzalloc(sizeof(*node), GFP_KERNEL);
-	if (!node)
-		return -ENOMEM;
-
-	node->ctx = ctx;
-	node->command_index = command_index;
-	INIT_LIST_HEAD(&node->list);
-	list_add_tail(&node->list, &mgmtctx->ctx_command_fifo_head);
-
-	XDNA_DBG(mgmtctx->xdna, "FIFO enqueue: ctx=%p, cmd_idx=%llu", ctx, command_index);
-
-	return 0;
-}
-
-/**
- * ve2_fifo_remove_ctx - Remove all FIFO entries for a given context
- * @mgmtctx: Pointer to the management context
- * @ctx: Pointer to the context to remove
- *
- * Must be called with mgmtctx->ctx_lock held.
- * This prevents use-after-free when a context is destroyed while
- * entries for it still exist in the scheduler FIFO.
- */
-void ve2_fifo_remove_ctx(struct amdxdna_mgmtctx *mgmtctx, struct amdxdna_ctx *ctx)
-{
-	struct amdxdna_ctx_command_fifo *c_ctx, *t_ctx;
-
-	lockdep_assert_held(&mgmtctx->ctx_lock);
-
-	list_for_each_entry_safe(c_ctx, t_ctx, &mgmtctx->ctx_command_fifo_head, list) {
-		if (c_ctx->ctx == ctx) {
-			XDNA_DBG(mgmtctx->xdna,
-				 "Removing FIFO entry for ctx %p, cmd_index %llu\n",
-				 ctx, c_ctx->command_index);
-			list_del(&c_ctx->list);
-			kfree(c_ctx);
-		}
-	}
-}
-
 // Get the context switch request bit
 static u32 get_ctx_bit(struct amdxdna_mgmtctx *mgmtctx)
 {
@@ -389,91 +646,6 @@ static int ve2_request_context_switch(struct amdxdna_dev *xdna,
 					   sizeof(u32), (void *)&val);
 
 	mgmtctx->is_context_req = 1;
-
-	return 0;
-}
-
-static struct amdxdna_ctx *
-ve2_response_ctx_switch_req(struct amdxdna_mgmtctx *mgmtctx)
-{
-	struct amdxdna_dev *xdna = mgmtctx->xdna;
-	struct amdxdna_ctx_command_fifo *c_ctx, *t_ctx;
-	struct amdxdna_ctx *hwctx = NULL;
-
-	/* Check if already locked */
-	lockdep_assert_held(&mgmtctx->ctx_lock);
-	XDNA_DBG(xdna, "printing fifo before context switch:\n");
-
-	/* Debug Only */
-	//ve2_fifo_displayQueue(mgmtctx);
-
-	/* Top need to be scheduled */
-	list_for_each_entry_safe(c_ctx, t_ctx, &mgmtctx->ctx_command_fifo_head, list) {
-		if (mgmtctx->is_idle_due_to_context == 1) {
-			hwctx = c_ctx->ctx;
-			XDNA_DBG(xdna, "NEW context to be schedule next: %p\n", hwctx);
-			mgmtctx->is_partition_idle = 0;
-			ve2_mgmt_handshake_init(mgmtctx->xdna, hwctx);
-			if (mgmtctx->active_ctx == hwctx)
-				break;
-
-			mgmtctx->active_ctx = hwctx;
-		}
-
-		if (t_ctx && c_ctx->ctx != t_ctx->ctx)
-			ve2_request_context_switch(mgmtctx->xdna, mgmtctx);
-
-		break;
-	}
-
-	return hwctx;
-}
-
-int ve2_mgmt_schedule_cmd(struct amdxdna_dev *xdna, struct amdxdna_ctx *hwctx,
-			  u64 command_index)
-{
-	struct amdxdna_mgmtctx  *mgmtctx =
-		&xdna->dev_handle->ve2_mgmtctx[hwctx->start_col];
-	int ret;
-
-	XDNA_DBG(xdna, "Schedule cmd: hwctx=%p, start_col=%u, active_ctx=%p, cmd_idx=%llu",
-		 hwctx, hwctx->start_col, mgmtctx->active_ctx, command_index);
-
-	mutex_lock(&mgmtctx->ctx_lock);
-	ret = ve2_fifo_enqueue(mgmtctx, hwctx, command_index);
-	if (ret) {
-		mutex_unlock(&mgmtctx->ctx_lock);
-		return ret;
-	}
-
-	if (!mgmtctx->active_ctx) {
-		mgmtctx->is_partition_idle = 0;
-		XDNA_DBG(xdna, "First command for partition, initializing hwctx %p", hwctx);
-		/* First command request. Initiate the handshake */
-		ve2_mgmt_handshake_init(xdna, hwctx);
-		mgmtctx->active_ctx = hwctx;
-	} else if (mgmtctx->active_ctx != hwctx) {
-		if (mgmtctx->is_partition_idle == 1) {
-			mgmtctx->is_partition_idle = 0;
-			XDNA_DBG(xdna, "Context switch: active=%p -> new=%p (partition idle)",
-				 mgmtctx->active_ctx, hwctx);
-			ve2_response_ctx_switch_req(mgmtctx);
-		} else {
-			XDNA_DBG(xdna, "Command queued: active=%p, pending=%p",
-				 mgmtctx->active_ctx, hwctx);
-		}
-	} else {
-		if (mgmtctx->is_idle_due_to_context == 1) {
-			mgmtctx->is_idle_due_to_context = 0;
-			mgmtctx->is_partition_idle = 0;
-			XDNA_DBG(xdna, "Resuming same context hwctx=%p after idle", hwctx);
-			ve2_mgmt_handshake_init(xdna, hwctx);
-			mgmtctx->active_ctx = hwctx;
-		}
-	}
-
-	mutex_unlock(&mgmtctx->ctx_lock);
-	notify_fw_cmd_ready(mgmtctx->active_ctx);
 
 	return 0;
 }
@@ -583,72 +755,6 @@ static bool ve2_check_idle_or_queue_not_empty(struct amdxdna_mgmtctx  *mgmtctx)
 	return false;
 }
 
-static void ve2_scheduler_work(struct work_struct *work)
-{
-	struct amdxdna_mgmtctx *mgmtctx =
-		container_of(work, struct amdxdna_mgmtctx, sched_work);
-
-	XDNA_DBG(mgmtctx->xdna, "Scheduler work: start_col=%u, active_ctx=%p",
-		 mgmtctx->start_col, mgmtctx->active_ctx);
-
-	mutex_lock(&mgmtctx->ctx_lock);
-
-	/* Check if context is being destroyed */
-	if (!mgmtctx->active_ctx || !mgmtctx->active_ctx->priv) {
-		XDNA_DBG(mgmtctx->xdna, "Scheduler work: no active context, exiting");
-		mutex_unlock(&mgmtctx->ctx_lock);
-		return;
-	}
-
-	/*
-	 * 3 case possible:
-	 * 1. it was completion interrupt but idle/queue_not_empty bit was set as cert moved forward
-	 * 2. idle bit is set
-	 * 3. queue_not_empty bit is set
-	 */
-
-	ve2_check_context_req(mgmtctx);
-
-	if (mgmtctx->active_ctx->priv->misc_intrpt_flag) {
-		XDNA_ERR(mgmtctx->xdna, "MISC interrupt from firmware!!!\n");
-	} else if (ve2_check_queue_not_empty(mgmtctx)) {
-		XDNA_DBG(mgmtctx->xdna, "Scheduler: queue not empty for active_ctx=%p",
-			 mgmtctx->active_ctx);
-		/*
-		 * there are more command but cert ack ctx switch bit
-		 * we schedule next ctx and if no more ctx are there we set partition idle
-		 */
-		if (!ve2_response_ctx_switch_req(mgmtctx)) {
-			mgmtctx->is_partition_idle = 1;
-			/*
-			 * no more command in fifo and Partition is IDLE, this can never happen
-			 * as we got queue_not_empty bit, that means active ctx should have more
-			 * commands.
-			 */
-			XDNA_DBG(mgmtctx->xdna,
-				 "No more command in fifo and Partition is IDLE active hwctx:%p ------> ",
-				 mgmtctx->active_ctx);
-		}
-	} else if (ve2_check_idle(mgmtctx)) {
-		XDNA_DBG(mgmtctx->xdna, "Scheduler: partition idle for active_ctx=%p",
-			 mgmtctx->active_ctx);
-		/*
-		 * 1. no more command and cert is in idle
-		 * 2. no more command and cert ack ctx switch bit
-		 * in both condition we schedule next ctx and if no more ctx are there we set
-		 * partition idle.
-		 */
-		if (!ve2_response_ctx_switch_req(mgmtctx)) {
-			mgmtctx->is_partition_idle = 1;
-			XDNA_DBG(mgmtctx->xdna, "Partition now idle, no pending contexts");
-		}
-	} else {
-		XDNA_DBG(mgmtctx->xdna, "Scheduler: no action needed, active_ctx=%p",
-			 mgmtctx->active_ctx);
-	}
-	mutex_unlock(&mgmtctx->ctx_lock);
-}
-
 static u32 get_cert_idle_status(struct amdxdna_mgmtctx  *mgmtctx)
 {
 	struct device *aie_dev = mgmtctx->mgmt_aiedev;
@@ -659,40 +765,6 @@ static u32 get_cert_idle_status(struct amdxdna_mgmtctx  *mgmtctx)
 					  sizeof(cert_idle_status), (void *)&cert_idle_status);
 
 	return cert_idle_status;
-}
-
-static int pop_from_ctx_command_fifo_till(struct amdxdna_mgmtctx *mgmtctx,
-					  struct amdxdna_ctx *active_ctx,
-					  u64 read_index)
-{
-	struct amdxdna_ctx_command_fifo *c_ctx, *t_ctx;
-
-	XDNA_DBG(mgmtctx->xdna, "%s for active_ctx:%p read_index:%llu\n",
-		 __func__, active_ctx, read_index);
-	XDNA_DBG(mgmtctx->xdna, "printing fifo before pop:\n");
-	ve2_fifo_display_queue(mgmtctx);
-	list_for_each_entry_safe(c_ctx, t_ctx, &mgmtctx->ctx_command_fifo_head, list) {
-		if (c_ctx->ctx != active_ctx) {
-			XDNA_DBG(mgmtctx->xdna,
-				 "POP BREAK as next_ctx=%p != ctx:%p so setting ctx switch bit\n",
-				 c_ctx->ctx, c_ctx);
-			ve2_request_context_switch(mgmtctx->xdna, mgmtctx);
-			break;
-		}
-
-		if (c_ctx->command_index <= read_index) {
-			XDNA_DBG(mgmtctx->xdna, "POP ctx:%p command index:%llu\n",
-				 c_ctx->ctx, c_ctx->command_index);
-			list_del(&c_ctx->list);
-			kfree(c_ctx);
-		} else {
-			XDNA_DBG(mgmtctx->xdna,
-				 "POP BREAK at temp_ctx:%p command index:%llu active_ctx:%p read_index:%llu\n",
-				 c_ctx->ctx, c_ctx->command_index, active_ctx, read_index);
-			break;
-		}
-	}
-	return 0;
 }
 
 static void ve2_irq_handler(u32 partition_id, void *cb_arg)
@@ -734,13 +806,10 @@ static void ve2_irq_handler(u32 partition_id, void *cb_arg)
 		 hwctx, read_index, write_index, get_ctx_bit(mgmtctx),
 		 get_cert_idle_status(mgmtctx));
 
-	/* Race condition: what happen if more command completed bet this point and
-	 * point waiq get executed(check for command completed). This will only happen
-	 * when cert is not in sleep ... that means we got completion interrupt..
-	 * if cert move forwarded to execute more command that is the expected behaviour..
-	 * max to max we will go out of order.
+	/*
+	 * Signal completed jobs by checking pending[] array.
+	 * DRM scheduler will automatically call free_job for signaled jobs.
 	 */
-	pop_from_ctx_command_fifo_till(mgmtctx, hwctx, read_index);
 
 	wake_up_interruptible_all(&hwctx->priv->waitq);
 
@@ -1111,6 +1180,62 @@ static void ve2_aie_error_cb(void *arg)
 }
 
 /**
+ * ve2_init_drm_scheduler - Initialize DRM scheduler for a partition
+ * @mgmtctx: Management context to initialize scheduler for
+ *
+ * Creates and initializes the DRM GPU scheduler for this partition.
+ * Each partition gets one scheduler that handles job ordering across
+ * multiple hardware contexts sharing the partition.
+ *
+ * Return: 0 on success, negative error code on failure
+ */
+static int ve2_init_drm_scheduler(struct amdxdna_mgmtctx *mgmtctx)
+{
+	struct drm_gpu_scheduler *sched = &mgmtctx->sched;
+	unsigned long timeout_ms = 2000;  /* 2 second timeout */
+	int ret;
+
+	XDNA_DBG(mgmtctx->xdna, "Initializing DRM scheduler for partition start_col=%u",
+		 mgmtctx->start_col);
+
+	/*
+	 * Initialize DRM scheduler for this partition.
+	 * Signature (for older kernel API):
+	 * drm_sched_init(sched, ops, workqueue, num_rqs, hw_jobs_limit, hang_limit,
+	 *                timeout, timeout_wq, atomic_timeout_wq, name, dev)
+	 */
+	ret = drm_sched_init(sched, &ve2_sched_ops,
+			     NULL,					/* No parent workqueue */
+			     DRM_SCHED_PRIORITY_COUNT,			/* num_rqs (priority count) */
+			     mgmtctx->xdna->dev_handle->hwctx_limit,	/* hw_jobs_limit */
+			     0,						/* hang_limit (0 = disabled) */
+			     msecs_to_jiffies(timeout_ms),		/* timeout */
+			     NULL,					/* timeout_wq */
+			     NULL,					/* atomic_timeout_wq */
+			     "ve2_mgmt",				/* name */
+			     mgmtctx->xdna->ddev.dev);			/* dev */
+	if (ret) {
+		XDNA_ERR(mgmtctx->xdna, "Failed to init DRM scheduler: %d", ret);
+		return ret;
+	}
+
+	/* Create workqueue for scheduler work */
+	mgmtctx->mgmtctx_workq = create_singlethread_workqueue("ve2_sched");
+	if (!mgmtctx->mgmtctx_workq) {
+		XDNA_ERR(mgmtctx->xdna, "Failed to create scheduler workqueue");
+		drm_sched_fini(sched);
+		return -ENOMEM;
+	}
+
+	INIT_WORK(&mgmtctx->sched_work, ve2_sched_work);
+
+	XDNA_DBG(mgmtctx->xdna, "DRM scheduler initialized successfully for partition %u",
+		 mgmtctx->start_col);
+
+	return 0;
+}
+
+/**
  * ve2_create_mgmt_partition - Create and initialize a management partition for VE2 device
  * @xdna: Pointer to the AMD XDNA device structure
  * @hwctx: Pointer to the hardware context structure
@@ -1158,19 +1283,22 @@ static int ve2_create_mgmt_partition(struct amdxdna_dev *xdna,
 		nhwctx->aie_dev = mgmtctx->mgmt_aiedev;
 		mutex_init(&mgmtctx->ctx_lock);
 		mutex_init(&mgmtctx->async_errs_cache.lock);
+		/* Initialize partition as idle (no active context yet) */
+		mgmtctx->is_partition_idle = 1;
+		mgmtctx->active_ctx = NULL;
 		memset(&mgmtctx->async_errs_cache.err, 0, sizeof(mgmtctx->async_errs_cache.err));
 		init_completion(&mgmtctx->error_cb_completion);
 		atomic_set(&mgmtctx->error_cb_in_progress, 0);
-		INIT_LIST_HEAD(&mgmtctx->ctx_command_fifo_head);
-		/* Create workqueue for scheduling the command */
-		mgmtctx->mgmtctx_workq = create_workqueue("ve2_mgmtctx_scheduler");
-		if (!mgmtctx->mgmtctx_workq) {
-			XDNA_ERR(xdna, "Failed to create Workqueue for scheduler");
+
+		/* Initialize DRM scheduler */
+		ret = ve2_init_drm_scheduler(mgmtctx);
+		if (ret) {
+			XDNA_ERR(xdna, "Failed to init DRM scheduler, ret=%d", ret);
 			aie_partition_release(mgmtctx->mgmt_aiedev);
-			return -ENOMEM;
+			return ret;
 		}
-		INIT_WORK(&mgmtctx->sched_work, ve2_scheduler_work);
-		/* Register AIE error call back function. */
+
+		/* Register AIE error callback function */
 		ret = aie_register_error_notification(nhwctx->aie_dev, ve2_aie_error_cb, mgmtctx);
 		XDNA_DBG(xdna, "Registered AIE error call back function, ret : %d\n", ret);
 	} else {
@@ -1220,25 +1348,6 @@ static int ve2_xrs_release(struct amdxdna_dev *xdna, struct amdxdna_ctx *hwctx,
 	return xrs_release_resource(xdna->dev_handle->xrs_hdl, (uintptr_t)hwctx, load_act);
 }
 
-static void cert_clear_partition(struct amdxdna_dev *xdna, struct amdxdna_ctx_priv *nhwctx)
-{
-	struct device *aie_dev = nhwctx->aie_dev;
-	u32 num_col = nhwctx->num_col;
-	int ret = 0;
-	struct aie_op_handshake_data *hs_data;
-
-	hs_data = ve2_prepare_hs_data(xdna, nhwctx, false);
-	if (!hs_data) {
-		XDNA_ERR(xdna, "No memory for hs_data\n");
-		return;
-	}
-
-	ret = aie_partition_handshake_update(aie_dev, hs_data, num_col);
-	if (ret < 0)
-		XDNA_ERR(xdna, "aie partition handshake update failed, ret: %d\n", ret);
-	ve2_free_hs_data(hs_data, num_col);
-}
-
 /**
  * ve2_mgmt_destroy_partition - Destroys a VE2 management partition and releases
  *                              associated resources.
@@ -1278,7 +1387,6 @@ int ve2_mgmt_destroy_partition(struct amdxdna_ctx *hwctx)
 	if (load_act.release_aie_part) {
 		struct workqueue_struct *wq = NULL;
 
-		cert_clear_partition(xdna, nhwctx);
 		mutex_lock(&mgmtctx->ctx_lock);
 		/* Update the active context as partition doesn't exists any more */
 		mgmtctx->active_ctx = NULL;
@@ -1287,8 +1395,15 @@ int ve2_mgmt_destroy_partition(struct amdxdna_ctx *hwctx)
 
 		mutex_unlock(&mgmtctx->ctx_lock);
 
+		/* Destroy DRM scheduler */
+		drm_sched_fini(&mgmtctx->sched);
+		XDNA_DBG(xdna, "DRM scheduler destroyed for partition %u", start_col);
+
+		/* Destroy context switch workqueue */
 		if (wq)
 			destroy_workqueue(wq);
+
+		/* Unregister error callback and teardown partition */
 		aie_unregister_error_notification(nhwctx->aie_dev);
 		XDNA_DBG(xdna, "%s: Un-registered ve2_aie_error_cb() callback\n", __func__);
 		aie_partition_teardown(nhwctx->aie_dev);

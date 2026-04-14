@@ -7,6 +7,7 @@
 #define _VE2_OF_H_
 
 #include <linux/timekeeping.h>
+#include <drm/gpu_scheduler.h>
 #include "amdxdna_error.h"
 #include "amdxdna_aux_drv.h"
 #include "ve2_host_queue.h"
@@ -74,13 +75,6 @@ struct ve2_config_hwctx {
 	u32	opcode_timeout_config;
 };
 
-// Define the node struct for the FIFO queue
-struct amdxdna_ctx_command_fifo {
-	struct amdxdna_ctx              *ctx;
-	u64                             command_index;
-	struct list_head                list;
-};
-
 struct amdxdna_ctx_priv {
 	u32				start_col;
 	u32				num_col;
@@ -90,6 +84,13 @@ struct amdxdna_ctx_priv {
 	struct aie_partition_init_args	*args;
 	struct ve2_hsa_queue		hwctx_hsa_queue;
 	struct ve2_config_hwctx		*hwctx_config;
+
+	/* DRM Scheduler components */
+	struct drm_sched_entity		entity;		/* Scheduling entity for this hwctx */
+	struct drm_gpu_scheduler	*sched;		/* Pointer to mgmtctx scheduler */
+	u64				seq;		/* Job sequence counter */
+
+	/* Job tracking */
 	wait_queue_head_t		waitq;
 	struct amdxdna_sched_job	*pending[HWCTX_MAX_CMDS];
 	struct timer_list		event_timer;
@@ -110,7 +111,11 @@ struct amdxdna_mgmtctx {
 	u32				start_col;
 	u32				mgmt_partid;
 	struct aie_partition_init_args	args;
-	struct list_head		ctx_command_fifo_head;
+
+	/* DRM Scheduler components */
+	struct drm_gpu_scheduler	sched;		/* DRM scheduler for this partition */
+
+	/* Context switching */
 	struct mutex			ctx_lock; /* protect ctx add/remove/update */
 	struct work_struct		sched_work;
 	struct workqueue_struct		*mgmtctx_workq;
@@ -157,6 +162,8 @@ void ve2_free_firmware_slots(struct amdxdna_dev_hdl *xdna_hdl, u32 max_cols);
 int ve2_cmd_submit(struct amdxdna_sched_job *job, u32 *syncobj_hdls,
 		   u64 *syncobj_points, u32 syncobj_cnt, u64 *seq);
 int ve2_cmd_wait(struct amdxdna_ctx *hwctx, u64 seq, u32 timeout);
+struct dma_fence *ve2_cmd_get_out_fence(struct amdxdna_ctx *hwctx, u64 seq);
+void ve2_job_put(struct amdxdna_sched_job *job);
 
 /* ve2_debug.c */
 int ve2_set_aie_state(struct amdxdna_client *client, struct amdxdna_drm_set_state *args);
