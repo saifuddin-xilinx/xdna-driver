@@ -797,7 +797,7 @@ int aie2_hwctx_init(struct amdxdna_hwctx *hwctx)
 #endif
 	if (ret) {
 		XDNA_ERR(xdna, "Initialize hwctx priv failed, ret %d", ret);
-		goto unpin_heap;
+		return ret;
 	}
 
 	ret = drm_sched_entity_init(&priv->entity, DRM_SCHED_PRIORITY_NORMAL,
@@ -812,6 +812,7 @@ int aie2_hwctx_init(struct amdxdna_hwctx *hwctx)
 		XDNA_ERR(xdna, "Create col list failed, ret %d", ret);
 		goto fini_priv;
 	}
+	hwctx->max_opc = xdna->dev_handle->priv->col_opc * hwctx->num_col;
 
 	ret = amdxdna_pm_resume_get_locked(xdna);
 	if (ret)
@@ -826,13 +827,13 @@ int aie2_hwctx_init(struct amdxdna_hwctx *hwctx)
 	ret = aie2_hwctx_map_heap(hwctx);
 	if (ret) {
 		XDNA_ERR(xdna, "Map host buffer failed, ret %d", ret);
-		goto release_resource;
+		goto release_dpm;
 	}
 
 	ret = aie2_ctx_syncobj_create(hwctx);
 	if (ret) {
 		XDNA_ERR(xdna, "Create syncobj failed, ret %d", ret);
-		goto release_resource;
+		goto release_dpm;
 	}
 	amdxdna_pm_suspend_put(xdna);
 
@@ -842,6 +843,8 @@ int aie2_hwctx_init(struct amdxdna_hwctx *hwctx)
 
 	return 0;
 
+release_dpm:
+	aie2_pm_release_dpm_level(xdna->dev_handle, hwctx->priv->req_dpm_level);
 release_resource:
 	aie2_release_resource(hwctx);
 	aie2_hwctx_release_heap(hwctx);
