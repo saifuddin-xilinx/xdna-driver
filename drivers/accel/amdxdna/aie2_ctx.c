@@ -969,37 +969,17 @@ free_cus:
 	return ret;
 }
 
-/**
- * aie2_cmd_wait_op - Wait for an AIE2 command to complete.
- * @hwctx:      Hardware context that submitted the command.
- * @seq:        Command sequence number to wait on.
- * @timeout_ms: Timeout in milliseconds; 0 means wait indefinitely.
- *
- * Retrieves the dma_fence associated with @seq from the hwctx syncobj
- * and blocks until it signals or @timeout_ms elapses.
- *
- * Returns 0 on success, -ETIME if the timeout expires, -ENOENT if the
- * fence for @seq cannot be found (sequence number too old or never submitted).
- */
-int aie2_cmd_wait_op(struct amdxdna_hwctx *hwctx, u64 seq, u32 timeout_ms)
+static void aie2_cmd_wait(struct amdxdna_hwctx *hwctx, u64 seq)
 {
-	unsigned long timeout = timeout_ms ?
-		msecs_to_jiffies(timeout_ms) : MAX_SCHEDULE_TIMEOUT;
-	struct dma_fence *out_fence;
-	long lret;
+	struct dma_fence *out_fence = aie2_cmd_get_out_fence(hwctx, seq);
 
-	out_fence = aie2_cmd_get_out_fence(hwctx, seq);
-	if (!out_fence)
-		return -ENOENT;
+	if (!out_fence) {
+		XDNA_ERR(hwctx->client->xdna, "Failed to get fence");
+		return;
+	}
 
-	lret = dma_fence_wait_timeout(out_fence, true, timeout);
+	dma_fence_wait_timeout(out_fence, false, MAX_SCHEDULE_TIMEOUT);
 	dma_fence_put(out_fence);
-
-	if (lret == 0)
-		return -ETIME;
-	if (lret < 0)
-		return lret;
-	return 0;
 }
 
 static int aie2_hwctx_cfg_debug_bo(struct amdxdna_hwctx *hwctx, u32 bo_hdl,
@@ -1039,7 +1019,7 @@ static int aie2_hwctx_cfg_debug_bo(struct amdxdna_hwctx *hwctx, u32 bo_hdl,
 		goto put_obj;
 	}
 
-	aie2_cmd_wait_op(hwctx, seq, 3000 /* ms */);
+	aie2_cmd_wait(hwctx, seq);
 	if (cmd.result) {
 		XDNA_ERR(xdna, "Response failure 0x%x", cmd.result);
 		goto put_obj;
@@ -1091,7 +1071,7 @@ int aie2_hwctx_sync_debug_bo(struct amdxdna_hwctx *hwctx, u32 debug_bo_hdl)
 		return ret;
 	}
 
-	aie2_cmd_wait_op(hwctx, seq, 3000 /* ms */);
+	aie2_cmd_wait(hwctx, seq);
 	if (cmd.result) {
 		XDNA_ERR(xdna, "Response failure 0x%x", cmd.result);
 		return -EINVAL;
