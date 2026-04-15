@@ -464,6 +464,12 @@ static int aie2_hw_resume(struct amdxdna_dev *xdna)
 		return ret;
 	}
 
+	ret = aie2_pm_resume(xdna->dev_handle);
+	if (ret) {
+		XDNA_ERR(xdna, "Restore PM state failed, %d", ret);
+		return ret;
+	}
+
 	list_for_each_entry(client, &xdna->client_list, node) {
 		ret = aie2_hwctx_resume(client);
 		if (ret)
@@ -588,6 +594,18 @@ static int aie2_init(struct amdxdna_dev *xdna)
 		goto release_fw;
 	}
 	xdna->dev_handle = ndev;
+
+	while (ndev->priv->dpm_clk_tbl[ndev->max_dpm_level].hclk)
+		ndev->max_dpm_level++;
+
+	if (ndev->max_dpm_level > DPM_MAX_LEVELS) {
+		XDNA_ERR(xdna, "DPM levels %d exceeds max %d",
+			 ndev->max_dpm_level, DPM_MAX_LEVELS);
+		ret = -EINVAL;
+		goto release_fw;
+	}
+
+	ndev->max_dpm_level--;
 
 	ret = aie2_hw_start(xdna);
 	if (ret) {
@@ -1205,7 +1223,6 @@ const struct amdxdna_dev_ops aie2_ops = {
 	.hwctx_config = aie2_hwctx_config,
 	.hwctx_sync_debug_bo = aie2_hwctx_sync_debug_bo,
 	.cmd_submit = aie2_cmd_submit,
-	.cmd_wait = aie2_cmd_wait_op,
 	.hmm_invalidate = aie2_hmm_invalidate,
 	.get_array = aie2_get_array,
 	.get_dev_revision = aie2_get_dev_rev,

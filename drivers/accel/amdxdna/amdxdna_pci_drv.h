@@ -83,7 +83,10 @@ struct amdxdna_fw_feature_tbl {
 	u32 min_minor;
 };
 
-/* PCI-specific dev_info extensions */
+/*
+ * struct amdxdna_dev_info - Device hardware information
+ * Record device static information, like reg, mbox, PSP, SMU bar index
+ */
 struct amdxdna_dev_info {
 	int				reg_bar;
 	int				mbox_bar;
