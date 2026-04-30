@@ -332,4 +332,3 @@ void amdxdna_dev_cleanup(struct amdxdna_dev *xdna)
 	xdna->dev_info->ops->fini(xdna);
 	mutex_unlock(&xdna->dev_lock);
 }
-
