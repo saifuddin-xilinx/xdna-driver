@@ -483,10 +483,7 @@ static int __init amdxdna_mod_init(void)
 {
 	int ret;
 
-	amdxdna_carveout_init();
 	ret = pci_register_driver(&amdxdna_pci_driver);
-	if (ret)
-		amdxdna_carveout_fini();
 
 	return ret;
 }
@@ -494,7 +491,6 @@ static int __init amdxdna_mod_init(void)
 static void __exit amdxdna_mod_exit(void)
 {
 	pci_unregister_driver(&amdxdna_pci_driver);
-	amdxdna_carveout_fini();
 }
 
 module_init(amdxdna_mod_init);

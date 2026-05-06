@@ -291,10 +291,6 @@ u64 amdxdna_gem_uva(struct amdxdna_gem_obj *abo)
 		return AMDXDNA_INVALID_ADDR;
 	}
 
-	if (abo->type == AMDXDNA_BO_DEV_HEAP &&
-	    abo->mem.uva == AMDXDNA_INVALID_ADDR && abo->client)
-		return amdxdna_dev_heap_uva(abo);
-
 	return abo->mem.uva;
 }
 
@@ -451,22 +447,6 @@ static int amdxdna_hmm_register(struct amdxdna_gem_obj *abo,
 	if (is_import_bo(abo) && vma->vm_file && vma->vm_file->f_mapping)
 		mapping_set_unevictable(vma->vm_file->f_mapping);
 
-	if (abo->type == AMDXDNA_BO_DEV_HEAP && abo->client) {
-		u64 expected;
-
-		mutex_lock(&abo->client->mm_lock);
-		expected = amdxdna_dev_heap_uva(abo);
-		mutex_unlock(&abo->client->mm_lock);
-
-		if (expected != AMDXDNA_INVALID_ADDR &&
-		    expected != addr) {
-			XDNA_ERR(xdna, "Dev heap mmap addr 0x%lx != expected 0x%llx",
-				 addr, expected);
-			ret = -EINVAL;
-			goto unreg_notifier;
-		}
-	}
-
 	down_write(&xdna->notifier_lock);
 	if (list_empty(&abo->mem.umap_list))
 		abo->mem.uva = addr;
@@ -475,8 +455,6 @@ static int amdxdna_hmm_register(struct amdxdna_gem_obj *abo,
 
 	return 0;
 
-unreg_notifier:
-	mmu_interval_notifier_remove(&mapp->notifier);
 free_pfns:
 	kvfree(mapp->range.hmm_pfns);
 free_map:
@@ -1046,8 +1024,6 @@ amdxdna_drm_create_dev_heap_bo(struct drm_device *dev,
 	struct amdxdna_client *client = filp->driver_priv;
 	struct amdxdna_dev *xdna = to_xdna_dev(dev);
 	struct amdxdna_gem_obj *abo;
-	struct amdxdna_hwctx *hwctx;
-	unsigned long hwctx_id;
 	int ret;
 
 	WARN_ON(!is_power_of_2(xdna->dev_info->dev_mem_size));

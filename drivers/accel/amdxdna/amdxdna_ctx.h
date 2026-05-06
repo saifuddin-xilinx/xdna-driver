@@ -22,6 +22,7 @@
 #define HWCTX_MAX_TIMEOUT	60000 /* milliseconds */
 #define MAX_CHAIN_CMDBUF_SIZE	SZ_4K
 
+/* Common hardware context private data - generic across all hardware */
 struct amdxdna_hwctx_priv {
 	void				*mbox_chann;
 
@@ -38,13 +39,13 @@ struct amdxdna_hwctx_priv {
 	/* Completed job counter */
 	u64				completed;
 
-	/* DPM level computed for this context */
-	u32				req_dpm_level;
-
 	struct amdxdna_gem_obj		*cmd_buf[HWCTX_MAX_CMDS];
 	struct drm_syncobj		*syncobj;
 
 	struct amdxdna_gem_obj		*last_pinned_chunk;
+
+	/* Hardware-specific private data pointer */
+	void				*hw_priv;
 };
 
 enum ert_cmd_opcode {
@@ -126,6 +127,7 @@ struct amdxdna_cmd {
 };
 
 #define INVALID_CU_IDX		(~0U)
+#define AMDXDNA_INVALID_DOORBELL_OFFSET	(~0U)
 
 struct amdxdna_hwctx {
 	struct amdxdna_client		*client;
@@ -260,9 +262,11 @@ int amdxdna_drm_wait_cmd_ioctl(struct drm_device *dev, void *data, struct drm_fi
 int amdxdna_hwctx_col_list(struct amdxdna_hwctx *hwctx, u32 row_count,
 			   u32 total_col, bool natural_align);
 int amdxdna_hwctx_priv_init(struct amdxdna_hwctx *hwctx,
+			    struct amdxdna_hwctx_priv *priv,
 			    const struct drm_sched_backend_ops *sched_ops,
 			    u32 timeout_ms);
-void amdxdna_hwctx_priv_fini(struct amdxdna_hwctx *hwctx);
+void amdxdna_hwctx_priv_fini(struct amdxdna_hwctx *hwctx,
+			     struct amdxdna_hwctx_priv *priv);
 void amdxdna_hwctx_fini(struct amdxdna_hwctx *hwctx,
 			void (*release_resource)(struct amdxdna_hwctx *hwctx));
 int amdxdna_ctx_syncobj_create(struct amdxdna_hwctx *hwctx);

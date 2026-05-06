@@ -10,7 +10,6 @@
 
 #include "aie2_pci.h"
 #include "amdxdna_pci_drv.h"
-#include "amdxdna_solver.h"
 #include "amdxdna_pm.h"
 
 #define AIE2_CLK_GATING_ENABLE	1
@@ -47,6 +46,23 @@ int aie2_pm_set_dpm(struct amdxdna_dev_hdl *ndev, u32 dpm_level)
 int aie2_pm_start(struct amdxdna_dev_hdl *ndev)
 {
 	int ret;
+
+	if (ndev->dev_status != AIE2_DEV_UNINIT) {
+		/* Resume device */
+		ret = ndev->priv->hw_ops->set_dpm(ndev, ndev->dpm_level);
+		if (ret)
+			return ret;
+
+		ret = aie2_pm_set_clk_gating(ndev, ndev->clk_gating);
+		if (ret)
+			return ret;
+
+		return 0;
+	}
+
+	while (ndev->priv->dpm_clk_tbl[ndev->max_dpm_level].hclk)
+		ndev->max_dpm_level++;
+	ndev->max_dpm_level--;
 
 	ret = ndev->priv->hw_ops->set_dpm(ndev, ndev->max_dpm_level);
 	if (ret)

@@ -464,12 +464,6 @@ static int aie2_hw_resume(struct amdxdna_dev *xdna)
 		return ret;
 	}
 
-	ret = aie2_pm_resume(xdna->dev_handle);
-	if (ret) {
-		XDNA_ERR(xdna, "Restore PM state failed, %d", ret);
-		return ret;
-	}
-
 	list_for_each_entry(client, &xdna->client_list, node) {
 		ret = aie2_hwctx_resume(client);
 		if (ret)
@@ -594,18 +588,6 @@ static int aie2_init(struct amdxdna_dev *xdna)
 		goto release_fw;
 	}
 	xdna->dev_handle = ndev;
-
-	while (ndev->priv->dpm_clk_tbl[ndev->max_dpm_level].hclk)
-		ndev->max_dpm_level++;
-
-	if (ndev->max_dpm_level > DPM_MAX_LEVELS) {
-		XDNA_ERR(xdna, "DPM levels %d exceeds max %d",
-			 ndev->max_dpm_level, DPM_MAX_LEVELS);
-		ret = -EINVAL;
-		goto release_fw;
-	}
-
-	ndev->max_dpm_level--;
 
 	ret = aie2_hw_start(xdna);
 	if (ret) {
@@ -830,6 +812,9 @@ static int aie2_get_hwctx_status(struct amdxdna_client *client,
 	struct amdxdna_client *tmp_client;
 	int ret;
 
+	if (!amdxdna_is_admin())
+		return -EPERM;
+
 	drm_WARN_ON(&xdna->ddev, !mutex_is_locked(&xdna->dev_lock));
 
 	array_args.element_size = sizeof(struct amdxdna_drm_query_hwctx);
@@ -898,6 +883,9 @@ static int aie2_get_telemetry(struct amdxdna_client *client,
 	struct amdxdna_dev *xdna = client->xdna;
 	struct amdxdna_client *tmp_client;
 	int ret;
+
+	if (!amdxdna_is_admin())
+		return -EPERM;
 
 	elem_num = xdna->dev_handle->priv->hwctx_limit;
 	header_sz = struct_size(header, map, elem_num);
@@ -1223,8 +1211,9 @@ const struct amdxdna_dev_ops aie2_ops = {
 	.hwctx_config = aie2_hwctx_config,
 	.hwctx_sync_debug_bo = aie2_hwctx_sync_debug_bo,
 	.cmd_submit = aie2_cmd_submit,
-	.hmm_invalidate = aie2_hmm_invalidate,
+	.hmm_invalidate = amdxdna_hmm_invalidate,
 	.get_array = aie2_get_array,
+	.get_coredump = aie2_get_aie_coredump,
 	.get_dev_revision = aie2_get_dev_rev,
 	.hwctx_heap_expand = aie2_hwctx_heap_expand,
 };

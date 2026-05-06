@@ -797,6 +797,8 @@ int aie2_hwctx_init(struct amdxdna_hwctx *hwctx)
 #endif
 	if (ret) {
 		XDNA_ERR(xdna, "Initialize hwctx priv failed, ret %d", ret);
+		kfree(aie2_priv);
+		kfree(priv);
 		return ret;
 	}
 
@@ -812,7 +814,6 @@ int aie2_hwctx_init(struct amdxdna_hwctx *hwctx)
 		XDNA_ERR(xdna, "Create col list failed, ret %d", ret);
 		goto fini_priv;
 	}
-	hwctx->max_opc = xdna->dev_handle->priv->col_opc * hwctx->num_col;
 
 	ret = amdxdna_pm_resume_get_locked(xdna);
 	if (ret)
@@ -827,13 +828,13 @@ int aie2_hwctx_init(struct amdxdna_hwctx *hwctx)
 	ret = aie2_hwctx_map_heap(hwctx);
 	if (ret) {
 		XDNA_ERR(xdna, "Map host buffer failed, ret %d", ret);
-		goto release_dpm;
+		goto release_resource;
 	}
 
 	ret = aie2_ctx_syncobj_create(hwctx);
 	if (ret) {
 		XDNA_ERR(xdna, "Create syncobj failed, ret %d", ret);
-		goto release_dpm;
+		goto release_resource;
 	}
 	amdxdna_pm_suspend_put(xdna);
 
@@ -843,8 +844,6 @@ int aie2_hwctx_init(struct amdxdna_hwctx *hwctx)
 
 	return 0;
 
-release_dpm:
-	aie2_pm_release_dpm_level(xdna->dev_handle, hwctx->priv->req_dpm_level);
 release_resource:
 	aie2_release_resource(hwctx);
 	aie2_hwctx_release_heap(hwctx);
@@ -870,6 +869,7 @@ free_cmd_bufs:
 void aie2_hwctx_fini(struct amdxdna_hwctx *hwctx)
 {
 	struct amdxdna_dev *xdna = hwctx->client->xdna;
+	struct amdxdna_hwctx_priv *priv = hwctx->priv;
 
 	XDNA_DBG(xdna, "%s sequence number %lld", hwctx->name, hwctx->priv->seq);
 	aie2_hwctx_wait_for_idle(hwctx);
@@ -1326,19 +1326,4 @@ int aie2_hwctx_heap_expand(struct amdxdna_hwctx *hwctx)
 	}
 
 	return 0;
-}
-
-void aie2_hmm_invalidate(struct amdxdna_gem_obj *abo,
-			 unsigned long cur_seq)
-{
-	struct amdxdna_dev *xdna = to_xdna_dev(to_gobj(abo)->dev);
-	struct drm_gem_object *gobj = to_gobj(abo);
-	long ret;
-
-	ret = dma_resv_wait_timeout(gobj->resv, DMA_RESV_USAGE_BOOKKEEP,
-				    true, MAX_SCHEDULE_TIMEOUT);
-	if (!ret)
-		XDNA_ERR(xdna, "Failed to wait for bo, ret %ld", ret);
-	else if (ret == -ERESTARTSYS)
-		XDNA_DBG(xdna, "Wait for bo interrupted by signal");
 }

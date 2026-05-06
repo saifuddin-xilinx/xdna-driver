@@ -9,7 +9,7 @@
 #include <linux/bitfield.h>
 #include <linux/mutex.h>
 
-#include "aie.h"
+#include "amdxdna_aie.h"
 #include "aie4_msg_priv.h"
 #include "aie4_pci.h"
 #include "amdxdna_ctx.h"
