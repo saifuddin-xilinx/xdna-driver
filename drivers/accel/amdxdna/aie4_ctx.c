@@ -11,7 +11,7 @@
 #include <drm/gpu_scheduler.h>
 #include <linux/types.h>
 
-#include "aie.h"
+#include "amdxdna_aie.h"
 #include "aie4_host_queue.h"
 #include "aie4_pci.h"
 #include "aie4_msg_priv.h"
@@ -20,6 +20,9 @@
 #include "amdxdna_mailbox.h"
 #include "amdxdna_mailbox_helper.h"
 #include "amdxdna_pci_drv.h"
+
+/* Helper macro to access AIE4-specific hardware context private data */
+#define to_aie4_hwctx_priv(hwctx) ((struct aie4_hwctx_priv *)(hwctx)->priv->hw_priv)
 
 static irqreturn_t cert_comp_isr(int irq, void *p)
 {
@@ -120,7 +123,7 @@ static int aie4_hwctx_create(struct amdxdna_hwctx *hwctx)
 {
 	DECLARE_AIE_MSG(aie4_msg_create_hw_context, AIE4_MSG_OP_CREATE_HW_CONTEXT);
 	struct amdxdna_client *client = hwctx->client;
-	struct amdxdna_hwctx_priv *priv = hwctx->priv;
+	struct aie4_hwctx_priv *aie4_priv = to_aie4_hwctx_priv(hwctx);
 	struct amdxdna_dev *xdna = hwctx->client->xdna;
 	struct amdxdna_dev_hdl *ndev = xdna->dev_handle;
 	int ret;
@@ -139,8 +142,8 @@ static int aie4_hwctx_create(struct amdxdna_hwctx *hwctx)
 		FIELD_PREP(AIE4_MSG_PASID_VLD, 1);
 	req.priority_band = hwctx->qos.priority;
 
-	req.hsa_addr_high = upper_32_bits(amdxdna_gem_dev_addr(priv->umq_bo));
-	req.hsa_addr_low = lower_32_bits(amdxdna_gem_dev_addr(priv->umq_bo));
+	req.hsa_addr_high = upper_32_bits(amdxdna_gem_dev_addr(aie4_priv->umq_bo));
+	req.hsa_addr_low = lower_32_bits(amdxdna_gem_dev_addr(aie4_priv->umq_bo));
 
 	XDNA_DBG(xdna, "pasid 0x%x, num_tiles %d, hsa[0x%x 0x%x]",
 		 req.pasid, req.request_num_tiles, req.hsa_addr_high, req.hsa_addr_low);
@@ -157,13 +160,13 @@ static int aie4_hwctx_create(struct amdxdna_hwctx *hwctx)
 		 resp.doorbell_offset);
 
 	/* setup interrupt completion per msix index */
-	priv->cert_comp = aie4_lookup_cert_comp(ndev, resp.job_complete_msix_idx);
-	if (!priv->cert_comp) {
+	aie4_priv->cert_comp = aie4_lookup_cert_comp(ndev, resp.job_complete_msix_idx);
+	if (!aie4_priv->cert_comp) {
 		aie4_msg_destroy_context(ndev, resp.hw_context_id);
 		return -EINVAL;
 	}
 
-	priv->hw_ctx_id = resp.hw_context_id;
+	aie4_priv->hw_ctx_id = resp.hw_context_id;
 	hwctx->doorbell_offset = resp.doorbell_offset;
 
 	return 0;
@@ -172,25 +175,31 @@ static int aie4_hwctx_create(struct amdxdna_hwctx *hwctx)
 static void aie4_hwctx_destroy(struct amdxdna_hwctx *hwctx)
 {
 	struct amdxdna_client *client = hwctx->client;
-	struct amdxdna_hwctx_priv *priv = hwctx->priv;
+	struct aie4_hwctx_priv *aie4_priv = to_aie4_hwctx_priv(hwctx);
 	struct amdxdna_dev *xdna = client->xdna;
 	struct amdxdna_dev_hdl *ndev = xdna->dev_handle;
 
 	drm_WARN_ON(&xdna->ddev, !mutex_is_locked(&xdna->dev_lock));
 
-	aie4_msg_destroy_context(ndev, priv->hw_ctx_id);
-	aie4_put_cert_comp(priv->cert_comp);
+	aie4_msg_destroy_context(ndev, aie4_priv->hw_ctx_id);
+	aie4_put_cert_comp(aie4_priv->cert_comp);
 }
 
 static void aie4_hwctx_umq_fini(struct amdxdna_hwctx *hwctx)
 {
-	if (hwctx->priv && hwctx->priv->umq_bo)
-		drm_gem_object_put(to_gobj(hwctx->priv->umq_bo));
+	struct aie4_hwctx_priv *aie4_priv;
+
+	if (!hwctx->priv || !hwctx->priv->hw_priv)
+		return;
+
+	aie4_priv = to_aie4_hwctx_priv(hwctx);
+	if (aie4_priv->umq_bo)
+		drm_gem_object_put(to_gobj(aie4_priv->umq_bo));
 }
 
 static int aie4_hwctx_umq_init(struct amdxdna_hwctx *hwctx)
 {
-	struct amdxdna_hwctx_priv *priv = hwctx->priv;
+	struct aie4_hwctx_priv *aie4_priv = to_aie4_hwctx_priv(hwctx);
 	struct amdxdna_dev *xdna = hwctx->client->xdna;
 	struct amdxdna_gem_obj *umq_bo;
 	struct host_queue_header *qhdr;
@@ -205,7 +214,7 @@ static int aie4_hwctx_umq_init(struct amdxdna_hwctx *hwctx)
 		return -EINVAL;
 	}
 
-	priv->umq_bo = umq_bo;
+	aie4_priv->umq_bo = umq_bo;
 	/* get kva address for host queue read index and write index */
 	qhdr = amdxdna_gem_vmap(umq_bo);
 	if (!qhdr) {
@@ -213,8 +222,8 @@ static int aie4_hwctx_umq_init(struct amdxdna_hwctx *hwctx)
 		return -ENOMEM;
 	}
 
-	priv->umq_read_index = &qhdr->read_index;
-	priv->umq_write_index = &qhdr->write_index;
+	aie4_priv->umq_read_index = &qhdr->read_index;
+	aie4_priv->umq_write_index = &qhdr->write_index;
 
 	return 0;
 }
@@ -224,11 +233,19 @@ int aie4_hwctx_init(struct amdxdna_hwctx *hwctx)
 	struct amdxdna_client *client = hwctx->client;
 	struct amdxdna_dev *xdna = client->xdna;
 	struct amdxdna_hwctx_priv *priv;
+	struct aie4_hwctx_priv *aie4_priv;
 	int ret;
 
-	priv = kzalloc_obj(*priv);
+	priv = kzalloc(sizeof(*priv), GFP_KERNEL);
 	if (!priv)
 		return -ENOMEM;
+
+	aie4_priv = kzalloc(sizeof(*aie4_priv), GFP_KERNEL);
+	if (!aie4_priv) {
+		kfree(priv);
+		return -ENOMEM;
+	}
+	priv->hw_priv = aie4_priv;
 	hwctx->priv = priv;
 
 	ret = aie4_hwctx_umq_init(hwctx);
@@ -245,6 +262,7 @@ int aie4_hwctx_init(struct amdxdna_hwctx *hwctx)
 umq_fini:
 	aie4_hwctx_umq_fini(hwctx);
 free_priv:
+	kfree(priv->hw_priv);
 	kfree(priv);
 	hwctx->priv = NULL;
 	return ret;
@@ -254,6 +272,7 @@ void aie4_hwctx_fini(struct amdxdna_hwctx *hwctx)
 {
 	aie4_hwctx_destroy(hwctx);
 	aie4_hwctx_umq_fini(hwctx);
+	kfree(hwctx->priv->hw_priv);
 	kfree(hwctx->priv);
 }
 
@@ -264,8 +283,9 @@ static inline bool valid_queue_index(u64 read, u64 write, u32 capacity)
 
 static u64 get_read_index(struct amdxdna_hwctx *hwctx)
 {
-	u64 wi = READ_ONCE(*hwctx->priv->umq_write_index);
-	u64 ri = READ_ONCE(*hwctx->priv->umq_read_index);
+	struct aie4_hwctx_priv *aie4_priv = to_aie4_hwctx_priv(hwctx);
+	u64 wi = READ_ONCE(*aie4_priv->umq_write_index);
+	u64 ri = READ_ONCE(*aie4_priv->umq_read_index);
 	struct amdxdna_dev *xdna = hwctx->client->xdna;
 
 	/*
@@ -277,7 +297,7 @@ static u64 get_read_index(struct amdxdna_hwctx *hwctx)
 	if (!valid_queue_index(ri, wi, CTX_MAX_CMDS)) {
 		XDNA_WARN(xdna, "Invalid index, ri %llu, wi %llu", ri, wi);
 		usleep_range(100, 200);
-		ri = READ_ONCE(*hwctx->priv->umq_read_index);
+		ri = READ_ONCE(*aie4_priv->umq_read_index);
 		if (!valid_queue_index(ri, wi, CTX_MAX_CMDS)) {
 			XDNA_ERR(xdna, "Invalid index after retry, ri %llu, wi %llu", ri, wi);
 			ri = 0;
@@ -297,8 +317,8 @@ static inline bool check_cmd_done(struct amdxdna_hwctx *hwctx, u64 seq)
 int aie4_cmd_wait(struct amdxdna_hwctx *hwctx, u64 seq, u32 timeout)
 {
 	unsigned long wait_jifs = MAX_SCHEDULE_TIMEOUT;
-	struct amdxdna_hwctx_priv *priv = hwctx->priv;
-	struct cert_comp *cert_comp = priv->cert_comp;
+	struct aie4_hwctx_priv *aie4_priv = to_aie4_hwctx_priv(hwctx);
+	struct cert_comp *cert_comp = aie4_priv->cert_comp;
 	long ret;
 
 	if (timeout)

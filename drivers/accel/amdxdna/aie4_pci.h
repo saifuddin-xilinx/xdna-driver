@@ -10,7 +10,7 @@
 #include <linux/iopoll.h>
 #include <linux/pci.h>
 
-#include "aie.h"
+#include "amdxdna_aie.h"
 #include "amdxdna_mailbox.h"
 
 struct cert_comp {
@@ -21,7 +21,8 @@ struct cert_comp {
 	wait_queue_head_t               waitq;
 };
 
-struct amdxdna_hwctx_priv {
+/* AIE4-specific hardware context private data */
+struct aie4_hwctx_priv {
 	struct amdxdna_gem_obj          *umq_bo;
 	u64                             *umq_read_index;
 	u64                             *umq_write_index;
@@ -91,6 +92,5 @@ int aie4_get_aie_coredump(struct amdxdna_dev *xdna,
 
 extern const struct amdxdna_dev_ops aie4_pf_ops;
 extern const struct amdxdna_dev_ops aie4_vf_ops;
-extern const struct amdxdna_dev_ops aie4_classic_ops;
 
 #endif /* _AIE4_PCI_H_ */

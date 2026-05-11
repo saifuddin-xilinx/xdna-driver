@@ -16,7 +16,7 @@
 
 #include "aie2_msg_priv.h"
 #include "aie2_pci.h"
-#include "aie2_solver.h"
+#include "amdxdna_solver.h"
 #include "amdxdna_ctx.h"
 #include "amdxdna_gem.h"
 #include "amdxdna_mailbox.h"
@@ -611,108 +611,25 @@ static const struct drm_sched_backend_ops sched_ops = {
 static int aie2_hwctx_col_list(struct amdxdna_hwctx *hwctx)
 {
 	struct amdxdna_dev *xdna = hwctx->client->xdna;
-	struct amdxdna_dev_hdl *ndev;
-	int start, end, first, last;
-	u32 width = 1, entries = 0;
-	int i;
+	struct amdxdna_dev_hdl *ndev = xdna->dev_handle;
+	bool natural_align;
 
-	if (!hwctx->num_tiles) {
-		XDNA_ERR(xdna, "Number of tiles is zero");
-		return -EINVAL;
-	}
-
-	ndev = xdna->dev_handle;
-	if (unlikely(!ndev->aie.metadata.core.row_count)) {
-		XDNA_WARN(xdna, "Core tile row count is zero");
-		return -EINVAL;
-	}
-
-	hwctx->num_col = hwctx->num_tiles / ndev->aie.metadata.core.row_count;
-	if (!hwctx->num_col || hwctx->num_col > ndev->total_col) {
-		XDNA_ERR(xdna, "Invalid num_col %d", hwctx->num_col);
-		return -EINVAL;
-	}
-
-	if (ndev->priv->col_align == COL_ALIGN_NATURE)
-		width = hwctx->num_col;
-
-	/*
-	 * In range [start, end], find out columns that is multiple of width.
-	 *	'first' is the first column,
-	 *	'last' is the last column,
-	 *	'entries' is the total number of columns.
-	 */
-	start =  xdna->dev_info->first_col;
-	end =  ndev->total_col - hwctx->num_col;
-	if (start > 0 && end == 0) {
-		XDNA_DBG(xdna, "Force start from col 0");
-		start = 0;
-	}
-	first = start + (width - start % width) % width;
-	last = end - end % width;
-	if (last >= first)
-		entries = (last - first) / width + 1;
-	XDNA_DBG(xdna, "start %d end %d first %d last %d",
-		 start, end, first, last);
-
-	if (unlikely(!entries)) {
-		XDNA_ERR(xdna, "Start %d end %d width %d",
-			 start, end, width);
-		return -EINVAL;
-	}
-
-	hwctx->col_list = kmalloc_objs(*hwctx->col_list, entries);
-	if (!hwctx->col_list)
-		return -ENOMEM;
-
-	hwctx->col_list_len = entries;
-	hwctx->col_list[0] = first;
-	for (i = 1; i < entries; i++)
-		hwctx->col_list[i] = hwctx->col_list[i - 1] + width;
-
-	print_hex_dump_debug("col_list: ", DUMP_PREFIX_OFFSET, 16, 4, hwctx->col_list,
-			     entries * sizeof(*hwctx->col_list), false);
-	return 0;
+	natural_align = (ndev->priv->col_align == COL_ALIGN_NATURE);
+	return amdxdna_hwctx_col_list(hwctx, ndev->aie.metadata.core.row_count,
+				      ndev->total_col, natural_align);
 }
 
 static int aie2_alloc_resource(struct amdxdna_hwctx *hwctx)
 {
 	struct amdxdna_dev *xdna = hwctx->client->xdna;
-	struct alloc_requests *xrs_req;
-	u32 temporal_only_col = 0;
-	int ret;
-
-	xrs_req = kzalloc_obj(*xrs_req);
-	if (!xrs_req)
-		return -ENOMEM;
 
 	if (AIE_FEATURE_ON(&xdna->dev_handle->aie, AIE2_TEMPORAL_ONLY)) {
-		xrs_req->cdo.start_cols = &temporal_only_col;
-		xrs_req->cdo.cols_len = 1;
-		xrs_req->cdo.ncols = xdna->dev_handle->total_col;
-	} else {
-		xrs_req->cdo.start_cols = hwctx->col_list;
-		xrs_req->cdo.cols_len = hwctx->col_list_len;
-		xrs_req->cdo.ncols = hwctx->num_col;
+		hwctx->num_unused_col = xdna->dev_handle->total_col - hwctx->num_col;
+		hwctx->num_col = xdna->dev_handle->total_col;
+		return aie2_create_context(xdna->dev_handle, hwctx);
 	}
-	/* Use platform opc */
-	xrs_req->cdo.qos_cap.opc = xdna->dev_handle->priv->col_opc * hwctx->num_col;
 
-	xrs_req->rqos.gops = hwctx->qos.gops;
-	xrs_req->rqos.fps = hwctx->qos.fps;
-	xrs_req->rqos.dma_bw = hwctx->qos.dma_bandwidth;
-	xrs_req->rqos.latency = hwctx->qos.latency;
-	xrs_req->rqos.exec_time = hwctx->qos.frame_exec_time;
-	xrs_req->rqos.priority = hwctx->qos.priority;
-
-	xrs_req->rid = (uintptr_t)hwctx;
-
-	ret = xrs_allocate_resource(xdna->xrs_hdl, xrs_req, hwctx);
-	if (ret)
-		XDNA_ERR(xdna, "Allocate AIE resource failed, ret %d", ret);
-
-	kfree(xrs_req);
-	return ret;
+	return amdxdna_alloc_resource(hwctx);
 }
 
 static void aie2_release_resource(struct amdxdna_hwctx *hwctx)
@@ -720,130 +637,52 @@ static void aie2_release_resource(struct amdxdna_hwctx *hwctx)
 	struct amdxdna_dev *xdna = hwctx->client->xdna;
 	int ret;
 
-	ret = xrs_release_resource(xdna->xrs_hdl, (uintptr_t)hwctx);
-	if (ret)
-		XDNA_ERR(xdna, "Release AIE resource failed, ret %d", ret);
+	if (AIE_FEATURE_ON(&xdna->dev_handle->aie, AIE2_TEMPORAL_ONLY)) {
+		ret = aie2_destroy_context(xdna->dev_handle, hwctx);
+		if (ret && ret != -ENODEV)
+			XDNA_ERR(xdna, "Destroy temporal only context failed, ret %d", ret);
+	} else {
+		amdxdna_release_resource(hwctx);
+	}
 }
 
 static int aie2_ctx_syncobj_create(struct amdxdna_hwctx *hwctx)
 {
-	struct amdxdna_dev *xdna = hwctx->client->xdna;
-	struct drm_file *filp = hwctx->client->filp;
-	struct drm_syncobj *syncobj;
-	u32 hdl;
-	int ret;
-
-	hwctx->syncobj_hdl = AMDXDNA_INVALID_FENCE_HANDLE;
-
-	ret = drm_syncobj_create(&syncobj, 0, NULL);
-	if (ret) {
-		XDNA_ERR(xdna, "Create ctx syncobj failed, ret %d", ret);
-		return ret;
-	}
-	ret = drm_syncobj_get_handle(filp, syncobj, &hdl);
-	if (ret) {
-		drm_syncobj_put(syncobj);
-		XDNA_ERR(xdna, "Create ctx syncobj handle failed, ret %d", ret);
-		return ret;
-	}
-	hwctx->priv->syncobj = syncobj;
-	hwctx->syncobj_hdl = hdl;
-
-	return 0;
-}
-
-static void aie2_ctx_syncobj_destroy(struct amdxdna_hwctx *hwctx)
-{
-	/*
-	 * The syncobj_hdl is owned by user space and will be cleaned up
-	 * separately.
-	 */
-	drm_syncobj_put(hwctx->priv->syncobj);
+	return amdxdna_ctx_syncobj_create(hwctx);
 }
 
 int aie2_hwctx_init(struct amdxdna_hwctx *hwctx)
 {
 	struct amdxdna_client *client = hwctx->client;
 	struct amdxdna_dev *xdna = client->xdna;
-#ifdef HAVE_6_15_drm_sched_init
-	unsigned long timeout_jiffies = MAX_SCHEDULE_TIMEOUT;
-
-#ifdef HAVE_6_17_drm_gpu_sched_stat_no_hang
-	if (tdr_timeout_ms > 0)
-		timeout_jiffies = msecs_to_jiffies(tdr_timeout_ms);
-#endif
-	const struct drm_sched_init_args args = {
-		.ops = &sched_ops,
-#ifdef HAVE_drm_sched_init_args_num_rqs
-		.num_rqs = DRM_SCHED_PRIORITY_COUNT,
-#endif
-		.credit_limit = HWCTX_MAX_CMDS,
-		.timeout = timeout_jiffies,
-		.name = "amdxdna_js",
-		.dev = xdna->ddev.dev,
-	};
-#endif
-	struct drm_gpu_scheduler *sched;
 	struct amdxdna_hwctx_priv *priv;
-	int i, ret;
+	struct aie2_hwctx_priv *aie2_priv;
+	int ret;
 
-	priv = kzalloc_obj(*hwctx->priv);
+	priv = kzalloc(sizeof(*priv), GFP_KERNEL);
 	if (!priv)
 		return -ENOMEM;
-	hwctx->priv = priv;
 
-	sema_init(&priv->job_sem, HWCTX_MAX_CMDS);
-
-	for (i = 0; i < ARRAY_SIZE(priv->cmd_buf); i++) {
-		struct amdxdna_gem_obj *abo;
-		struct amdxdna_drm_create_bo args = {
-			.flags = 0,
-			.type = AMDXDNA_BO_DEV,
-			.vaddr = 0,
-			.size = MAX_CHAIN_CMDBUF_SIZE,
-		};
-
-		abo = amdxdna_drm_create_dev_bo(&xdna->ddev, &args, client->filp);
-		if (IS_ERR(abo)) {
-			XDNA_ERR(xdna, "Create dev bo failed, ret %ld", PTR_ERR(abo));
-			ret = PTR_ERR(abo);
-			goto free_cmd_bufs;
-		}
-
-		XDNA_DBG(xdna, "Command buf %d addr 0x%llx size 0x%lx",
-			 i, amdxdna_gem_dev_addr(abo), abo->mem.size);
-		priv->cmd_buf[i] = abo;
+	aie2_priv = kzalloc(sizeof(*aie2_priv), GFP_KERNEL);
+	if (!aie2_priv) {
+		kfree(priv);
+		return -ENOMEM;
 	}
+	priv->hw_priv = aie2_priv;
 
-	sched = &priv->sched;
-	mutex_init(&priv->io_lock);
-
-	fs_reclaim_acquire(GFP_KERNEL);
-	might_lock(&priv->io_lock);
-	fs_reclaim_release(GFP_KERNEL);
-#ifdef HAVE_6_15_drm_sched_init
-	ret = drm_sched_init(sched, &args);
-#else
-	ret = drm_sched_init(sched, &sched_ops, NULL, DRM_SCHED_PRIORITY_COUNT,
-			     HWCTX_MAX_CMDS, 0, MAX_SCHEDULE_TIMEOUT,
-			     NULL, NULL, "amdxdna_js", xdna->ddev.dev);
-#endif
+	ret = amdxdna_hwctx_priv_init(hwctx, priv, &sched_ops,
+				      tdr_timeout_ms > 0 ? tdr_timeout_ms : 0);
 	if (ret) {
-		XDNA_ERR(xdna, "Failed to init DRM scheduler. ret %d", ret);
-		goto free_cmd_bufs;
-	}
-
-	ret = drm_sched_entity_init(&priv->entity, DRM_SCHED_PRIORITY_NORMAL,
-				    &sched, 1, NULL);
-	if (ret) {
-		XDNA_ERR(xdna, "Failed to initial sched entiry. ret %d", ret);
-		goto free_sched;
+		XDNA_ERR(xdna, "Initialize hwctx priv failed, ret %d", ret);
+		kfree(aie2_priv);
+		kfree(priv);
+		return ret;
 	}
 
 	ret = aie2_hwctx_col_list(hwctx);
 	if (ret) {
 		XDNA_ERR(xdna, "Create col list failed, ret %d", ret);
-		goto free_entity;
+		goto fini_priv;
 	}
 
 	ret = amdxdna_pm_resume_get_locked(xdna);
@@ -882,27 +721,17 @@ suspend_put:
 	amdxdna_pm_suspend_put(xdna);
 free_col_list:
 	kfree(hwctx->col_list);
-free_entity:
-	drm_sched_entity_destroy(&priv->entity);
-free_sched:
-	drm_sched_fini(&priv->sched);
-free_cmd_bufs:
-	for (i = 0; i < ARRAY_SIZE(priv->cmd_buf); i++) {
-		if (!priv->cmd_buf[i])
-			continue;
-		drm_gem_object_put(to_gobj(priv->cmd_buf[i]));
-	}
-
+fini_priv:
+	amdxdna_hwctx_priv_fini(hwctx, priv);
+	kfree(priv->hw_priv);
 	kfree(priv);
 	return ret;
 }
 
 void aie2_hwctx_fini(struct amdxdna_hwctx *hwctx)
 {
-	struct amdxdna_dev *xdna;
-	int idx;
-
-	xdna = hwctx->client->xdna;
+	struct amdxdna_dev *xdna = hwctx->client->xdna;
+	struct amdxdna_hwctx_priv *priv = hwctx->priv;
 
 	XDNA_DBG(xdna, "%s sequence number %lld", hwctx->name, hwctx->priv->seq);
 	aie2_hwctx_wait_for_idle(hwctx);
@@ -929,15 +758,10 @@ void aie2_hwctx_fini(struct amdxdna_hwctx *hwctx)
 		   atomic64_read(&hwctx->job_free_cnt));
 	mutex_lock(&xdna->dev_lock);
 
-	drm_sched_fini(&hwctx->priv->sched);
-	aie2_ctx_syncobj_destroy(hwctx);
-
-	for (idx = 0; idx < ARRAY_SIZE(hwctx->priv->cmd_buf); idx++)
-		drm_gem_object_put(to_gobj(hwctx->priv->cmd_buf[idx]));
-
-	mutex_destroy(&hwctx->priv->io_lock);
-	kfree(hwctx->col_list);
-	kfree(hwctx->priv);
+	amdxdna_ctx_syncobj_destroy(hwctx);
+	amdxdna_hwctx_priv_fini(hwctx, priv);
+	kfree(priv->hw_priv);
+	kfree(priv);
 	kfree(hwctx->cus);
 }
 
@@ -1359,19 +1183,4 @@ int aie2_hwctx_heap_expand(struct amdxdna_hwctx *hwctx)
 	}
 
 	return 0;
-}
-
-void aie2_hmm_invalidate(struct amdxdna_gem_obj *abo,
-			 unsigned long cur_seq)
-{
-	struct amdxdna_dev *xdna = to_xdna_dev(to_gobj(abo)->dev);
-	struct drm_gem_object *gobj = to_gobj(abo);
-	long ret;
-
-	ret = dma_resv_wait_timeout(gobj->resv, DMA_RESV_USAGE_BOOKKEEP,
-				    true, MAX_SCHEDULE_TIMEOUT);
-	if (!ret)
-		XDNA_ERR(xdna, "Failed to wait for bo, ret %ld", ret);
-	else if (ret == -ERESTARTSYS)
-		XDNA_DBG(xdna, "Wait for bo interrupted by signal");
 }

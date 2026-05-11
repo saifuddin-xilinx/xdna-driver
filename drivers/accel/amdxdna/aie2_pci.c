@@ -10,6 +10,7 @@
 #include <drm/drm_managed.h>
 #include <drm/drm_print.h>
 #include <drm/gpu_scheduler.h>
+#include <linux/amd-pmf-io.h>
 #include <linux/cleanup.h>
 #include <linux/errno.h>
 #include <linux/firmware.h>
@@ -19,10 +20,10 @@
 #include <linux/xarray.h>
 #include <asm/hypervisor.h>
 
-#include "aie.h"
+#include "amdxdna_aie.h"
 #include "aie2_msg_priv.h"
 #include "aie2_pci.h"
-#include "aie2_solver.h"
+#include "amdxdna_solver.h"
 #include "amdxdna_ctx.h"
 #include "amdxdna_gem.h"
 #include "amdxdna_mailbox.h"
@@ -748,6 +749,63 @@ static int aie2_get_clock_metadata(struct amdxdna_client *client,
 	return ret;
 }
 
+static int aie2_get_sensors(struct amdxdna_client *client,
+			    struct amdxdna_drm_get_info *args)
+{
+#ifdef HAVE_7_0_amd_pmf_get_npu_data
+	struct amdxdna_dev_hdl *ndev = client->xdna->dev_handle;
+	struct amdxdna_drm_query_sensor sensor = {};
+	struct amd_pmf_npu_metrics npu_metrics;
+	u32 sensors_count = 0, i;
+	int ret;
+
+	ret = AIE2_GET_PMF_NPU_METRICS(&npu_metrics);
+	if (ret)
+		return ret;
+
+	sensor.type = AMDXDNA_SENSOR_TYPE_POWER;
+	sensor.input = npu_metrics.npu_power;
+	sensor.unitm = -3;
+	scnprintf(sensor.label, sizeof(sensor.label), "Total Power");
+	scnprintf(sensor.units, sizeof(sensor.units), "mW");
+
+	if (args->buffer_size < sizeof(sensor))
+		goto out;
+
+	if (copy_to_user(u64_to_user_ptr(args->buffer), &sensor, sizeof(sensor)))
+		return -EFAULT;
+
+	args->buffer_size -= sizeof(sensor);
+	sensors_count++;
+
+	for (i = 0; i < min_t(u32, ndev->total_col, 8); i++) {
+		memset(&sensor, 0, sizeof(sensor));
+		sensor.input = npu_metrics.npu_busy[i];
+		sensor.type = AMDXDNA_SENSOR_TYPE_COLUMN_UTILIZATION;
+		sensor.unitm = 0;
+		scnprintf(sensor.label, sizeof(sensor.label), "Column %d Utilization", i);
+		scnprintf(sensor.units, sizeof(sensor.units), "%%");
+
+		if (args->buffer_size < sizeof(sensor))
+			goto out;
+
+		if (copy_to_user(u64_to_user_ptr(args->buffer) + sensors_count * sizeof(sensor),
+				 &sensor, sizeof(sensor)))
+			return -EFAULT;
+
+		args->buffer_size -= sizeof(sensor);
+		sensors_count++;
+	}
+
+out:
+	args->buffer_size = sensors_count * sizeof(sensor);
+
+	return 0;
+#else
+	return -EOPNOTSUPP;
+#endif
+}
+
 static int aie2_hwctx_status_cb(struct amdxdna_hwctx *hwctx, void *arg)
 {
 	struct amdxdna_drm_hwctx_entry *tmp __free(kfree) = NULL;
@@ -974,7 +1032,7 @@ static int aie2_get_info(struct amdxdna_client *client, struct amdxdna_drm_get_i
 		ret = aie2_get_clock_metadata(client, args);
 		break;
 	case DRM_AMDXDNA_QUERY_SENSORS:
-		ret = amdxdna_query_sensors(client, args, ndev->total_col);
+		ret = aie2_get_sensors(client, args);
 		break;
 	case DRM_AMDXDNA_QUERY_HW_CONTEXTS:
 		ret = aie2_get_hwctx_status(client, args);
@@ -1200,7 +1258,7 @@ const struct amdxdna_dev_ops aie2_ops = {
 	.hwctx_config = aie2_hwctx_config,
 	.hwctx_sync_debug_bo = aie2_hwctx_sync_debug_bo,
 	.cmd_submit = aie2_cmd_submit,
-	.hmm_invalidate = aie2_hmm_invalidate,
+	.hmm_invalidate = amdxdna_hmm_invalidate,
 	.get_array = aie2_get_array,
 	.get_coredump = aie2_get_aie_coredump,
 	.get_dev_revision = aie2_get_dev_rev,

@@ -2,26 +2,14 @@
 /*
  * Copyright (C) 2026, Advanced Micro Devices, Inc.
  */
-#ifndef _AIE_H_
-#define _AIE_H_
+#ifndef _AMDXDNA_AIE_H_
+#define _AMDXDNA_AIE_H_
 
-#include "amdxdna_pci_drv.h"
+#include "amdxdna_drv.h"
 #include "amdxdna_mailbox.h"
 
 #define AIE_INTERVAL	20000	/* us */
 #define AIE_TIMEOUT	1000000	/* us */
-
-#if IS_ENABLED(CONFIG_AMD_PMF) && defined(HAVE_7_0_amd_pmf_get_npu_data)
-#include <linux/amd-pmf-io.h>
-#define AIE_GET_PMF_NPU_METRICS(metrics) amd_pmf_get_npu_data(metrics)
-#else
-#define AIE_GET_PMF_NPU_METRICS(metrics)				\
-({									\
-	typeof(metrics) _m = metrics;					\
-	memset(_m, 0xff, sizeof(*_m));					\
-	(-EOPNOTSUPP);							\
-})
-#endif
 
 struct psp_device;
 struct smu_device;
@@ -133,8 +121,6 @@ int aie_check_protocol(struct aie_device *aie, u32 fw_major, u32 fw_minor);
 void amdxdna_vbnv_init(struct amdxdna_dev *xdna);
 int amdxdna_get_metadata(struct aie_device *aie, struct amdxdna_client *client,
 			 struct amdxdna_drm_get_info *args);
-int amdxdna_query_sensors(struct amdxdna_client *client,
-			  struct amdxdna_drm_get_info *args, u32 total_col);
 void amdxdna_hmm_invalidate(struct amdxdna_gem_obj *abo, unsigned long cur_seq);
 bool amdxdna_hwctx_access_allowed(struct amdxdna_hwctx *hwctx, bool root_only);
 
@@ -183,4 +169,4 @@ void amdxdna_io_stats_job_start(struct amdxdna_client *client);
 void amdxdna_io_stats_job_done(struct amdxdna_client *client);
 u64 amdxdna_io_stats_busy_time_ns(struct amdxdna_client *client);
 
-#endif /* _AIE_H_ */
+#endif /* _AMDXDNA_AIE_H_ */

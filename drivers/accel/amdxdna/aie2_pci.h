@@ -13,7 +13,8 @@
 #include <linux/limits.h>
 #include <linux/semaphore.h>
 
-#include "aie.h"
+#include "amdxdna_aie.h"
+#include "amdxdna_ctx.h"
 #include "aie2_msg_priv.h"
 #include "amdxdna_mailbox.h"
 
@@ -42,6 +43,33 @@
 	((_ndev)->priv->mbox_size) ? (_ndev)->priv->mbox_size : \
 	pci_resource_len(NDEV2PDEV(_ndev), (_ndev)->aie.xdna->dev_info->mbox_bar); \
 })
+
+#if IS_ENABLED(CONFIG_AMD_PMF) && defined(HAVE_7_0_amd_pmf_get_npu_data)
+#define AIE2_GET_PMF_NPU_METRICS(metrics) amd_pmf_get_npu_data(metrics)
+#define AIE2_GET_PMF_NPU_DATA(field, val)				\
+({									\
+	struct amd_pmf_npu_metrics _npu_metrics;			\
+	int _ret;							\
+									\
+	_ret = amd_pmf_get_npu_data(&_npu_metrics);			\
+	val = _ret ? U32_MAX : _npu_metrics.field;			\
+	(_ret);								\
+})
+#else
+#define AIE2_GET_PMF_NPU_METRICS(metrics)				\
+({									\
+	typeof(metrics) _m = metrics;					\
+	memset(_m, 0xff, sizeof(*_m));					\
+	(-EOPNOTSUPP);							\
+})
+
+#define SENSOR_DEFAULT_npu_power	U32_MAX
+#define AIE2_GET_PMF_NPU_DATA(field, val)				\
+({									\
+	val = SENSOR_DEFAULT_##field;					\
+	(-EOPNOTSUPP);							\
+})
+#endif
 
 enum aie2_sram_reg_idx {
 	MBOX_CHANN_OFF = 0,
@@ -73,32 +101,9 @@ struct dpm_clk_freq {
 	u32	hclk;
 };
 
-/*
- * Define the maximum number of pending commands in a hardware context.
- * Must be power of 2!
- */
-#define HWCTX_MAX_CMDS		4
-#define get_job_idx(seq) ((seq) & (HWCTX_MAX_CMDS - 1))
-struct amdxdna_hwctx_priv {
-	void				*mbox_chann;
-
-	struct drm_gpu_scheduler	sched;
-	struct drm_sched_entity		entity;
-
-	struct mutex			io_lock; /* protect seq and cmd order */
-	struct wait_queue_head		job_free_wq;
-	u32				num_pending;
-	u64				seq;
-	struct semaphore		job_sem;
-	bool				job_done;
-
-	/* Completed job counter */
-	u64				completed;
-
-	struct amdxdna_gem_obj		*cmd_buf[HWCTX_MAX_CMDS];
-	struct drm_syncobj		*syncobj;
-
-	struct amdxdna_gem_obj		*last_pinned_chunk;
+/* AIE2-specific hardware context private data */
+struct aie2_hwctx_priv {
+	u32	req_dpm_level;
 };
 
 enum aie2_dev_status {
@@ -293,7 +298,6 @@ void aie2_hwctx_suspend(struct amdxdna_client *client);
 int aie2_hwctx_resume(struct amdxdna_client *client);
 int aie2_cmd_submit(struct amdxdna_hwctx *hwctx, struct amdxdna_sched_job *job, u64 *seq);
 int aie2_hwctx_heap_expand(struct amdxdna_hwctx *hwctx);
-void aie2_hmm_invalidate(struct amdxdna_gem_obj *abo, unsigned long cur_seq);
 
 /* TDR APIs */
 #ifndef HAVE_6_17_drm_gpu_sched_stat_no_hang

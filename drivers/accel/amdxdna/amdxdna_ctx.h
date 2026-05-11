@@ -9,8 +9,43 @@
 #include <linux/bitfield.h>
 
 #include "amdxdna_gem.h"
+#include <drm/gpu_scheduler.h>
 
-struct amdxdna_hwctx_priv;
+/*
+ * Define the maximum number of pending commands in a hardware context.
+ * Must be power of 2!
+ */
+#define HWCTX_MAX_CMDS		4
+#define get_job_idx(seq) ((seq) & (HWCTX_MAX_CMDS - 1))
+
+#define HWCTX_MAX_TIMEOUT	60000 /* milliseconds */
+#define MAX_CHAIN_CMDBUF_SIZE	SZ_4K
+
+/* Common hardware context private data - generic across all hardware */
+struct amdxdna_hwctx_priv {
+	void				*mbox_chann;
+
+	struct drm_gpu_scheduler	sched;
+	struct drm_sched_entity		entity;
+
+	struct mutex			io_lock; /* protect seq and cmd order */
+	struct wait_queue_head		job_free_wq;
+	u32				num_pending;
+	u64				seq;
+	struct semaphore		job_sem;
+	bool				job_done;
+
+	/* Completed job counter */
+	u64				completed;
+
+	struct amdxdna_gem_obj		*cmd_buf[HWCTX_MAX_CMDS];
+	struct drm_syncobj		*syncobj;
+
+	struct amdxdna_gem_obj		*last_pinned_chunk;
+
+	/* Hardware-specific private data pointer */
+	void				*hw_priv;
+};
 
 enum ert_cmd_opcode {
 	ERT_START_CU = 0,
@@ -91,6 +126,7 @@ struct amdxdna_cmd {
 };
 
 #define INVALID_CU_IDX		(~0U)
+#define AMDXDNA_INVALID_DOORBELL_OFFSET	(~0U)
 
 struct amdxdna_hwctx {
 	struct amdxdna_client		*client;
@@ -219,5 +255,19 @@ int amdxdna_drm_config_hwctx_ioctl(struct drm_device *dev, void *data, struct dr
 int amdxdna_drm_destroy_hwctx_ioctl(struct drm_device *dev, void *data, struct drm_file *filp);
 int amdxdna_drm_submit_cmd_ioctl(struct drm_device *dev, void *data, struct drm_file *filp);
 int amdxdna_drm_wait_cmd_ioctl(struct drm_device *dev, void *data, struct drm_file *filp);
+
+/* Hardware context helper functions */
+int amdxdna_hwctx_col_list(struct amdxdna_hwctx *hwctx, u32 row_count,
+			   u32 total_col, bool natural_align);
+int amdxdna_hwctx_priv_init(struct amdxdna_hwctx *hwctx,
+			    struct amdxdna_hwctx_priv *priv,
+			    const struct drm_sched_backend_ops *sched_ops,
+			    u32 timeout_ms);
+void amdxdna_hwctx_priv_fini(struct amdxdna_hwctx *hwctx,
+			     struct amdxdna_hwctx_priv *priv);
+void amdxdna_hwctx_fini(struct amdxdna_hwctx *hwctx,
+			void (*release_resource)(struct amdxdna_hwctx *hwctx));
+int amdxdna_ctx_syncobj_create(struct amdxdna_hwctx *hwctx);
+void amdxdna_ctx_syncobj_destroy(struct amdxdna_hwctx *hwctx);
 
 #endif /* _AMDXDNA_CTX_H_ */
