@@ -84,18 +84,14 @@ int aie4_attach_work_buffer(struct amdxdna_dev_hdl *ndev, dma_addr_t addr, u32 s
 	return ret;
 }
 
-int aie4_get_aie_coredump(struct amdxdna_dev *xdna,
+int aie4_get_aie_coredump(struct amdxdna_hwctx *hwctx,
 			  struct amdxdna_msg_buf_hdl *list_hdl,
-			  struct amdxdna_hwctx *hwctx, u32 num_bufs)
+			  u32 num_bufs)
 {
-	struct amdxdna_dev_hdl *ndev = xdna->dev_handle;
 	DECLARE_AIE_MSG(aie4_msg_aie4_coredump, AIE4_MSG_OP_AIE_COREDUMP);
+	struct amdxdna_dev_hdl *ndev = hwctx->client->xdna->dev_handle;
+	struct amdxdna_dev *xdna = hwctx->client->xdna;
 	int ret;
-
-	if (!AIE_FEATURE_ON(&ndev->aie, AIE4_GET_COREDUMP)) {
-		XDNA_DBG(xdna, "Get coredump unsupported for the device or firmware version");
-		return -EOPNOTSUPP;
-	}
 
 	req.context_id = hwctx->fw_ctx_id;
 	req.pasid = FIELD_PREP(AIE4_MSG_PASID, hwctx->client->pasid) |
@@ -108,4 +104,80 @@ int aie4_get_aie_coredump(struct amdxdna_dev *xdna,
 		XDNA_ERR(xdna, "Get coredump got status 0x%x", resp.status);
 
 	return ret;
+}
+
+int aie4_rw_aie_reg(struct amdxdna_hwctx *hwctx, bool is_read,
+		    u8 row, u8 col, u32 addr, u32 *value)
+{
+	DECLARE_AIE_MSG(aie4_msg_aie4_debug_access, AIE4_MSG_OP_AIE_RW_ACCESS);
+	struct amdxdna_dev_hdl *ndev = hwctx->client->xdna->dev_handle;
+	struct amdxdna_dev *xdna = hwctx->client->xdna;
+	enum aie4_access_type type;
+	int ret;
+
+	type = is_read ? AIE4_ACCESS_TYPE_REG_READ : AIE4_ACCESS_TYPE_REG_WRITE;
+
+	req.opcode = type;
+	req.context_id = hwctx->fw_ctx_id;
+	req.row = row;
+	req.col = col;
+	req.reg_access.reg_addr = addr;
+	if (!is_read)
+		req.reg_access.reg_wval = *value;
+
+	ret = aie_send_mgmt_msg_wait(&ndev->aie, &msg);
+	if (ret) {
+		XDNA_ERR(xdna, "AIE reg %s failed, ret %d",
+			 is_read ? "read" : "write", ret);
+		return ret;
+	}
+
+	if (is_read)
+		*value = resp.reg_rval;
+
+	return 0;
+}
+
+int aie4_rw_aie_mem(struct amdxdna_hwctx *hwctx, bool is_read,
+		    u8 row, u8 col, u32 aie_addr,
+		    dma_addr_t dram_addr, u32 size)
+{
+	DECLARE_AIE_MSG(aie4_msg_aie4_debug_access, AIE4_MSG_OP_AIE_RW_ACCESS);
+	struct amdxdna_dev_hdl *ndev = hwctx->client->xdna->dev_handle;
+	struct amdxdna_dev *xdna = hwctx->client->xdna;
+	enum aie4_access_type type;
+	int ret;
+
+	type = is_read ? AIE4_ACCESS_TYPE_MEM_READ : AIE4_ACCESS_TYPE_MEM_WRITE;
+
+	req.opcode = type;
+	req.context_id = hwctx->fw_ctx_id;
+	req.row = row;
+	req.col = col;
+	req.mem_access.buffer_addr = dram_addr;
+	req.mem_access.buffer_size = size;
+	req.mem_access.mem_addr = aie_addr;
+	req.mem_access.mem_size = size;
+	req.mem_access.pasid = FIELD_PREP(AIE4_MSG_PASID, hwctx->client->pasid) |
+			       FIELD_PREP(AIE4_MSG_PASID_VLD, 1);
+
+	ret = aie_send_mgmt_msg_wait(&ndev->aie, &msg);
+	if (ret) {
+		XDNA_ERR(xdna, "AIE mem %s failed, ret %d",
+			 is_read ? "read" : "write", ret);
+		return ret;
+	}
+
+	return 0;
+}
+
+void aie4_msg_init(struct amdxdna_dev_hdl *ndev)
+{
+	if (AIE_FEATURE_ON(&ndev->aie, AIE4_GET_COREDUMP))
+		ndev->aie.msg_ops.get_coredump = aie4_get_aie_coredump;
+
+	if (AIE_FEATURE_ON(&ndev->aie, AIE4_RW_ACCESS)) {
+		ndev->aie.msg_ops.rw_reg = aie4_rw_aie_reg;
+		ndev->aie.msg_ops.rw_mem = aie4_rw_aie_mem;
+	}
 }

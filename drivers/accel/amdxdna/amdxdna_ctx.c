@@ -3,7 +3,6 @@
  * Copyright (C) 2022-2026, Advanced Micro Devices, Inc.
  */
 
-#include "config_kernel.h"
 #include "drm/amdxdna_accel.h"
 #include <drm/drm_device.h>
 #include <drm/drm_drv.h>
@@ -11,16 +10,14 @@
 #include <drm/drm_gem.h>
 #include <drm/drm_gem_shmem_helper.h>
 #include <drm/drm_print.h>
-#include <drm/drm_syncobj.h>
 #include <drm/gpu_scheduler.h>
 #include <linux/xarray.h>
 #include "trace/events/amdxdna.h"
 
 #include "amdxdna_ctx.h"
 #include "amdxdna_gem.h"
-#include "amdxdna_drv.h"
+#include "amdxdna_pci_drv.h"
 #include "amdxdna_pm.h"
-#include "amdxdna_solver.h"
 
 #define MAX_HWCTX_ID		255
 #define MAX_ARG_COUNT		4095
@@ -72,22 +69,34 @@ static void amdxdna_hwctx_destroy_rcu(struct amdxdna_hwctx *hwctx,
 	synchronize_srcu(ss);
 
 	/* At this point, user is not able to submit new commands */
-	xdna->dev_info->ops->hwctx_fini(hwctx);
+	if (xdna->dev_info->ops->hwctx_fini)
+		xdna->dev_info->ops->hwctx_fini(hwctx);
 
 	kfree(hwctx->name);
 	kfree(hwctx);
 }
 
+/*
+ * Walks @client's hwctxs invoking @walk. If @filter is set, @walk runs
+ * only on the matching hwctx; returns -ENOENT if none matched.
+ * Otherwise @walk runs on every hwctx; halts on the first non-zero return.
+ */
 int amdxdna_hwctx_walk(struct amdxdna_client *client, void *arg,
+		       bool (*filter)(struct amdxdna_hwctx *hwctx, void *arg),
 		       int (*walk)(struct amdxdna_hwctx *hwctx, void *arg))
 {
+	int ret = filter ? -ENOENT : 0;
 	struct amdxdna_hwctx *hwctx;
 	unsigned long hwctx_id;
-	int ret = 0, idx;
+	int idx;
 
 	idx = srcu_read_lock(&client->hwctx_srcu);
 	amdxdna_for_each_hwctx(client, hwctx_id, hwctx) {
+		if (filter && !filter(hwctx, arg))
+			continue;
 		ret = walk(hwctx, arg);
+		if (filter)
+			break;
 		if (ret)
 			break;
 	}
@@ -210,6 +219,9 @@ int amdxdna_drm_create_hwctx_ioctl(struct drm_device *dev, void *data, struct dr
 	if (args->ext || args->ext_flags)
 		return -EINVAL;
 
+	if (!xdna->dev_info->ops->hwctx_init)
+		return -EOPNOTSUPP;
+
 	hwctx = kzalloc_obj(*hwctx);
 	if (!hwctx)
 		return -ENOMEM;
@@ -223,6 +235,8 @@ int amdxdna_drm_create_hwctx_ioctl(struct drm_device *dev, void *data, struct dr
 	hwctx->client = client;
 	hwctx->fw_ctx_id = -1;
 	hwctx->num_tiles = args->num_tiles;
+	hwctx->umq_bo_hdl = args->umq_bo;
+	hwctx->doorbell_offset = AMDXDNA_INVALID_DOORBELL_OFFSET;
 	hwctx->mem_size = args->mem_size;
 	hwctx->max_opc = args->max_opc;
 
@@ -255,6 +269,7 @@ int amdxdna_drm_create_hwctx_ioctl(struct drm_device *dev, void *data, struct dr
 
 	args->handle = hwctx->id;
 	args->syncobj_handle = hwctx->syncobj_hdl;
+	args->umq_doorbell = hwctx->doorbell_offset;
 
 	atomic64_set(&hwctx->job_submit_cnt, 0);
 	atomic64_set(&hwctx->job_free_cnt, 0);
@@ -606,6 +621,33 @@ free_cmd_bo_hdls:
 	return ret;
 }
 
+int amdxdna_cmd_wait(struct amdxdna_client *client, u32 ctx_hdl,
+		     u64 seq, u32 timeout)
+{
+	struct amdxdna_dev *xdna = client->xdna;
+	struct amdxdna_hwctx *hwctx;
+	int ret, idx;
+
+	if (!xdna->dev_info->ops->cmd_wait)
+		return -EOPNOTSUPP;
+
+	/* For locking concerns, see amdxdna_drm_exec_cmd_ioctl. */
+	idx = srcu_read_lock(&client->hwctx_srcu);
+	hwctx = xa_load(&client->hwctx_xa, ctx_hdl);
+	if (!hwctx) {
+		XDNA_DBG(xdna, "PID %d failed to get ctx %d",
+			 client->pid, ctx_hdl);
+		ret = -EINVAL;
+		goto unlock_ctx_srcu;
+	}
+
+	ret = xdna->dev_info->ops->cmd_wait(hwctx, seq, timeout);
+
+unlock_ctx_srcu:
+	srcu_read_unlock(&client->hwctx_srcu, idx);
+	return ret;
+}
+
 int amdxdna_drm_submit_cmd_ioctl(struct drm_device *dev, void *data, struct drm_file *filp)
 {
 	struct amdxdna_client *client = filp->driver_priv;
@@ -625,49 +667,6 @@ int amdxdna_drm_submit_cmd_ioctl(struct drm_device *dev, void *data, struct drm_
 	return -EINVAL;
 }
 
-/**
- * amdxdna_cmd_wait - Wait for a submitted command to complete.
- * @client:    The amdxdna client that submitted the command.
- * @hwctx_hdl: Hardware context handle.
- * @seq:       Command sequence number returned by amdxdna_cmd_submit().
- * @timeout_ms: Timeout in milliseconds (0 = wait indefinitely).
- *
- * Looks up the hardware context under SRCU read lock to prevent it from
- * being destroyed concurrently, then dispatches to the backend's
- * ops->cmd_wait() implementation.
- *
- * The SRCU lock protects the hwctx pointer from being freed while the
- * wait is in progress.  The backend is responsible for blocking on the
- * fence and releasing any internal resources before returning.
- *
- * Returns 0 on success, -ETIME on timeout, or a negative error code.
- */
-int amdxdna_cmd_wait(struct amdxdna_client *client, u32 hwctx_hdl,
-		     u64 seq, u32 timeout_ms)
-{
-	struct amdxdna_dev *xdna = client->xdna;
-	struct amdxdna_hwctx *hwctx;
-	int ret, idx;
-
-	if (!xdna->dev_info->ops->cmd_wait)
-		return -EOPNOTSUPP;
-
-	idx = srcu_read_lock(&client->hwctx_srcu);
-	hwctx = xa_load(&client->hwctx_xa, hwctx_hdl);
-	if (!hwctx) {
-		XDNA_DBG(xdna, "PID %d failed to get hwctx %d",
-			 client->pid, hwctx_hdl);
-		ret = -EINVAL;
-		goto unlock_srcu;
-	}
-
-	ret = xdna->dev_info->ops->cmd_wait(hwctx, seq, timeout_ms);
-
-unlock_srcu:
-	srcu_read_unlock(&client->hwctx_srcu, idx);
-	return ret;
-}
-
 int amdxdna_drm_wait_cmd_ioctl(struct drm_device *dev, void *data, struct drm_file *filp)
 {
 	struct amdxdna_client *client = filp->driver_priv;
@@ -675,249 +674,14 @@ int amdxdna_drm_wait_cmd_ioctl(struct drm_device *dev, void *data, struct drm_fi
 	struct amdxdna_drm_wait_cmd *args = data;
 	int ret;
 
-	XDNA_DBG(xdna, "PID %d hwctx %d timeout %d ms for cmd seq %lld",
+	XDNA_DBG(xdna, "PID %d ctx %d timeout set %d ms for cmd %llu",
 		 client->pid, args->hwctx, args->timeout, args->seq);
 
 	ret = amdxdna_cmd_wait(client, args->hwctx, args->seq, args->timeout);
 
-	XDNA_DBG(xdna, "PID %d hwctx %d cmd %lld wait finished, ret %d",
+	XDNA_DBG(xdna, "PID %d ctx %d cmd %lld wait finished, ret %d",
 		 client->pid, args->hwctx, args->seq, ret);
 
 	trace_amdxdna_debug_point(current->comm, args->seq, "job returned to user");
 	return ret;
-}
-
-int amdxdna_hwctx_col_list(struct amdxdna_hwctx *hwctx, u32 row_count,
-			   u32 total_col, bool natural_align)
-{
-	struct amdxdna_dev *xdna = hwctx->client->xdna;
-	int start, end, first, last;
-	u32 width = 1, entries = 0;
-	int i;
-
-	if (!hwctx->num_tiles) {
-		XDNA_ERR(xdna, "Number of tiles is zero");
-		return -EINVAL;
-	}
-
-	if (unlikely(!row_count)) {
-		XDNA_WARN(xdna, "Core tile row count is zero");
-		return -EINVAL;
-	}
-
-	hwctx->num_col = hwctx->num_tiles / row_count;
-	if (!hwctx->num_col || hwctx->num_col > total_col) {
-		XDNA_ERR(xdna, "Invalid num_col %d", hwctx->num_col);
-		return -EINVAL;
-	}
-
-	if (natural_align)
-		width = hwctx->num_col;
-
-	/*
-	 * In range [start, end], find out columns that is multiple of width.
-	 *	'first' is the first column,
-	 *	'last' is the last column,
-	 *	'entries' is the total number of columns.
-	 */
-	start = xdna->dev_info->first_col;
-	end = total_col - hwctx->num_col;
-	if (start > 0 && end == 0) {
-		XDNA_DBG(xdna, "Force start from col 0");
-		start = 0;
-	}
-	first = start + (width - start % width) % width;
-	last = end - end % width;
-	if (last >= first)
-		entries = (last - first) / width + 1;
-	XDNA_DBG(xdna, "start %d end %d first %d last %d",
-		 start, end, first, last);
-
-	if (unlikely(!entries)) {
-		XDNA_ERR(xdna, "Start %d end %d width %d",
-			 start, end, width);
-		return -EINVAL;
-	}
-
-	hwctx->col_list = kmalloc_array(entries, sizeof(*hwctx->col_list), GFP_KERNEL);
-	if (!hwctx->col_list)
-		return -ENOMEM;
-
-	hwctx->col_list_len = entries;
-	hwctx->col_list[0] = first;
-	for (i = 1; i < entries; i++)
-		hwctx->col_list[i] = hwctx->col_list[i - 1] + width;
-
-	print_hex_dump_debug("col_list: ", DUMP_PREFIX_OFFSET, 16, 4, hwctx->col_list,
-			     entries * sizeof(*hwctx->col_list), false);
-	return 0;
-}
-
-int amdxdna_hwctx_priv_init(struct amdxdna_hwctx *hwctx,
-			    struct amdxdna_hwctx_priv *priv,
-			    const struct drm_sched_backend_ops *sched_ops,
-			    u32 timeout_ms)
-{
-	struct amdxdna_client *client = hwctx->client;
-	struct amdxdna_dev *xdna = client->xdna;
-#ifdef HAVE_6_15_drm_sched_init
-	const struct drm_sched_init_args args = {
-		.ops = sched_ops,
-		.num_rqs = DRM_SCHED_PRIORITY_COUNT,
-		.credit_limit = HWCTX_MAX_CMDS,
-		.timeout = timeout_ms ? msecs_to_jiffies(timeout_ms) : MAX_SCHEDULE_TIMEOUT,
-		.name = "amdxdna_js",
-		.dev = xdna->ddev.dev,
-	};
-#endif
-	struct drm_gpu_scheduler *sched;
-	int i, ret;
-
-        if (!priv) {
-                XDNA_ERR(xdna, "Invalid hwctx priv");
-                return -EINVAL;
-        }
-
-	hwctx->priv = priv;
-	sema_init(&priv->job_sem, HWCTX_MAX_CMDS);
-
-	for (i = 0; i < ARRAY_SIZE(priv->cmd_buf); i++) {
-		struct amdxdna_gem_obj *abo;
-		struct amdxdna_drm_create_bo args = {
-			.flags = 0,
-			.type = AMDXDNA_BO_DEV,
-			.vaddr = 0,
-			.size = MAX_CHAIN_CMDBUF_SIZE,
-		};
-
-		abo = amdxdna_drm_create_dev_bo(&xdna->ddev, &args, client->filp);
-		if (IS_ERR(abo)) {
-			ret = PTR_ERR(abo);
-			goto free_cmd_bufs;
-		}
-
-		XDNA_DBG(xdna, "Command buf %d addr 0x%llx size 0x%lx",
-			 i, abo->mem.dma_addr, abo->mem.size);
-		priv->cmd_buf[i] = abo;
-	}
-
-	sched = &priv->sched;
-	mutex_init(&priv->io_lock);
-
-	fs_reclaim_acquire(GFP_KERNEL);
-	might_lock(&priv->io_lock);
-	fs_reclaim_release(GFP_KERNEL);
-#ifdef HAVE_6_15_drm_sched_init
-	ret = drm_sched_init(sched, &args);
-#else
-	ret = drm_sched_init(sched, sched_ops, NULL, DRM_SCHED_PRIORITY_COUNT,
-			     HWCTX_MAX_CMDS, 0,
-			     timeout_ms ? msecs_to_jiffies(timeout_ms) : MAX_SCHEDULE_TIMEOUT,
-			     NULL, NULL, "amdxdna_js", xdna->ddev.dev);
-#endif
-	if (ret) {
-		XDNA_ERR(xdna, "Failed to init DRM scheduler. ret %d", ret);
-		goto free_cmd_bufs;
-	}
-
-	ret = drm_sched_entity_init(&priv->entity, DRM_SCHED_PRIORITY_NORMAL,
-				    &sched, 1, NULL);
-	if (ret) {
-		XDNA_ERR(xdna, "Failed to initial sched entiry. ret %d", ret);
-		goto free_sched;
-	}
-
-	return 0;
-
-free_sched:
-	drm_sched_fini(&priv->sched);
-free_cmd_bufs:
-	for (i = 0; i < ARRAY_SIZE(priv->cmd_buf); i++) {
-		if (!priv->cmd_buf[i])
-			break;
-		drm_gem_object_put(to_gobj(priv->cmd_buf[i]));
-	}
-	return ret;
-}
-
-void amdxdna_hwctx_priv_fini(struct amdxdna_hwctx *hwctx,
-			     struct amdxdna_hwctx_priv *priv)
-{
-	int idx;
-
-	drm_sched_fini(&priv->sched);
-
-	for (idx = 0; idx < ARRAY_SIZE(priv->cmd_buf); idx++)
-		drm_gem_object_put(to_gobj(priv->cmd_buf[idx]));
-
-	mutex_destroy(&priv->io_lock);
-	kfree(hwctx->col_list);
-}
-
-void amdxdna_hwctx_fini(struct amdxdna_hwctx *hwctx,
-			void (*release_resource)(struct amdxdna_hwctx *hwctx))
-{
-	struct amdxdna_dev *xdna = hwctx->client->xdna;
-	struct amdxdna_hwctx_priv *priv = hwctx->priv;
-
-	/* Stop scheduler, release hw resource, restart to drain pending jobs */
-	drm_sched_stop(&hwctx->priv->sched, NULL);
-	release_resource(hwctx);
-#ifdef HAVE_6_13_drm_sched_start_errno
-	drm_sched_start(&hwctx->priv->sched, 0);
-#elif defined(HAVE_6_10_drm_sched_start_full_recovery)
-	drm_sched_start(&hwctx->priv->sched, true);
-#else
-	drm_sched_start(&hwctx->priv->sched);
-#endif
-
-	mutex_unlock(&xdna->dev_lock);
-	drm_sched_entity_destroy(&hwctx->priv->entity);
-
-	/* Wait for all submitted jobs to be completed or canceled */
-	wait_event(hwctx->priv->job_free_wq,
-		   atomic64_read(&hwctx->job_submit_cnt) ==
-		   atomic64_read(&hwctx->job_free_cnt));
-	mutex_lock(&xdna->dev_lock);
-
-	amdxdna_ctx_syncobj_destroy(hwctx);
-	amdxdna_hwctx_priv_fini(hwctx, priv);
-}
-
-int amdxdna_ctx_syncobj_create(struct amdxdna_hwctx *hwctx)
-{
-	struct amdxdna_dev *xdna = hwctx->client->xdna;
-	struct drm_syncobj *syncobj;
-	struct drm_file *filp;
-	u32 hdl;
-	int ret;
-
-	filp = hwctx->client->filp;
-
-	hwctx->syncobj_hdl = AMDXDNA_INVALID_FENCE_HANDLE;
-
-	ret = drm_syncobj_create(&syncobj, 0, NULL);
-	if (ret) {
-		XDNA_ERR(xdna, "Create ctx syncobj failed, ret %d", ret);
-		return ret;
-	}
-	ret = drm_syncobj_get_handle(filp, syncobj, &hdl);
-	if (ret) {
-		drm_syncobj_put(syncobj);
-		XDNA_ERR(xdna, "Create ctx syncobj handle failed, ret %d", ret);
-		return ret;
-	}
-	hwctx->priv->syncobj = syncobj;
-	hwctx->syncobj_hdl = hdl;
-
-	return 0;
-}
-
-void amdxdna_ctx_syncobj_destroy(struct amdxdna_hwctx *hwctx)
-{
-	/*
-	 * The syncobj_hdl is owned by user space and will be cleaned up
-	 * separately.
-	 */
-	drm_syncobj_put(hwctx->priv->syncobj);
 }

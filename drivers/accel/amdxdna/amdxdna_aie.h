@@ -11,6 +11,18 @@
 #define AIE_INTERVAL	20000	/* us */
 #define AIE_TIMEOUT	1000000	/* us */
 
+#if IS_ENABLED(CONFIG_AMD_PMF) && defined(HAVE_7_0_amd_pmf_get_npu_data)
+#include <linux/amd-pmf-io.h>
+#define AIE_GET_PMF_NPU_METRICS(metrics) amd_pmf_get_npu_data(metrics)
+#else
+#define AIE_GET_PMF_NPU_METRICS(metrics)				\
+({									\
+	typeof(metrics) _m = metrics;					\
+	memset(_m, 0xff, sizeof(*_m));					\
+	(-EOPNOTSUPP);							\
+})
+#endif
+
 struct psp_device;
 struct smu_device;
 
@@ -37,6 +49,20 @@ struct aie_metadata {
 	struct aie_tile_metadata shim;
 };
 
+struct amdxdna_hwctx;
+struct amdxdna_msg_buf_hdl;
+
+struct aie_msg_ops {
+	int (*get_coredump)(struct amdxdna_hwctx *hwctx,
+			    struct amdxdna_msg_buf_hdl *list_hdl,
+			    u32 num_bufs);
+	int (*rw_reg)(struct amdxdna_hwctx *hwctx, bool is_read,
+		      u8 row, u8 col, u32 addr, u32 *value);
+	int (*rw_mem)(struct amdxdna_hwctx *hwctx, bool is_read,
+		      u8 row, u8 col, u32 aie_addr,
+		      dma_addr_t dram_addr, u32 size);
+};
+
 struct aie_device {
 	struct amdxdna_dev *xdna;
 	struct mailbox_channel *mgmt_chann;
@@ -51,6 +77,7 @@ struct aie_device {
 	struct smu_device *smu_hdl;
 
 	struct aie_metadata metadata;
+	struct aie_msg_ops msg_ops;
 };
 
 #define DECLARE_AIE_MSG(name, op) \
@@ -121,8 +148,9 @@ int aie_check_protocol(struct aie_device *aie, u32 fw_major, u32 fw_minor);
 void amdxdna_vbnv_init(struct amdxdna_dev *xdna);
 int amdxdna_get_metadata(struct aie_device *aie, struct amdxdna_client *client,
 			 struct amdxdna_drm_get_info *args);
+int amdxdna_query_sensors(struct amdxdna_client *client,
+			  struct amdxdna_drm_get_info *args, u32 total_col);
 void amdxdna_hmm_invalidate(struct amdxdna_gem_obj *abo, unsigned long cur_seq);
-bool amdxdna_hwctx_access_allowed(struct amdxdna_hwctx *hwctx, bool root_only);
 
 struct amdxdna_msg_buf_hdl {
 	struct amdxdna_dev	*xdna;
@@ -137,7 +165,6 @@ struct amdxdna_msg_buf_hdl {
 
 struct amdxdna_msg_buf_hdl *amdxdna_alloc_msg_buff(struct amdxdna_dev *xdna, u32 size);
 void amdxdna_free_msg_buff(struct amdxdna_msg_buf_hdl *hdl);
-void amdxdna_clflush_msg_buff(struct amdxdna_msg_buf_hdl *hdl, u32 offset, u32 size);
 
 /*
  * struct amdxdna_coredump_buf_entry - __packed to match firmware buffer_list
@@ -151,6 +178,12 @@ struct amdxdna_coredump_buf_entry {
 int amdxdna_get_coredump(struct aie_device *aie,
 			 struct amdxdna_client *client,
 			 struct amdxdna_drm_get_array *args);
+int amdxdna_aie_tile_read(struct aie_device *aie,
+			  struct amdxdna_client *client,
+			  struct amdxdna_drm_get_array *args);
+int amdxdna_aie_tile_write(struct aie_device *aie,
+			   struct amdxdna_client *client,
+			   struct amdxdna_drm_set_state *args);
 
 /* aie_psp.c */
 struct psp_device *aiem_psp_create(struct drm_device *ddev, struct psp_config *conf);

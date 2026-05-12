@@ -32,6 +32,14 @@ MODULE_FIRMWARE("amdnpu/17f0_20/npu.sbin");
 MODULE_FIRMWARE("amdnpu/1502_00/npu_7.sbin");
 MODULE_FIRMWARE("amdnpu/17f0_10/npu_7.sbin");
 MODULE_FIRMWARE("amdnpu/17f0_11/npu_7.sbin");
+MODULE_FIRMWARE("amdnpu/17f1_10/npu.dev.sbin");
+MODULE_FIRMWARE("amdnpu/17f1_10/cert.dev.sbin");
+MODULE_FIRMWARE("amdnpu/17f2_10/npu.dev.sbin");
+MODULE_FIRMWARE("amdnpu/17f2_10/cert.dev.sbin");
+MODULE_FIRMWARE("amdnpu/1B0A_10/npu.dev.sbin");
+MODULE_FIRMWARE("amdnpu/1B0A_10/cert.dev.sbin");
+MODULE_FIRMWARE("amdnpu/1B0B_10/npu.dev.sbin");
+MODULE_FIRMWARE("amdnpu/1B0B_10/cert.dev.sbin");
 
 /*
  * Bind the driver base on (vendor_id, device_id) pair and later use the

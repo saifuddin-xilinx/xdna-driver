@@ -6,7 +6,6 @@
 #include "drm/amdxdna_accel.h"
 #include <drm/drm_device.h>
 #include <drm/gpu_scheduler.h>
-#include <linux/amd-pmf-io.h>
 #include <linux/bits.h>
 #include <linux/sizes.h>
 
@@ -100,6 +99,7 @@ const struct amdxdna_fw_feature_tbl npu4_fw_feature_table[] = {
 	{ .features = BIT_U64(AIE2_APP_HEALTH), .major = 6, .min_minor = 18 },
 	{ .features = BIT_U64(AIE2_ADD_HOST_BUFFER), .major = 6, .min_minor = 18 },
 	{ .features = BIT_U64(AIE2_GET_DEV_REVISION), .major = 6, .min_minor = 24 },
+	{ .features = BIT_U64(AIE2_RW_ACCESS), .major = 6, .min_minor = 24 },
 	{ .features = AIE2_ALL_FEATURES, .major = 7 },
 	{ 0 }
 };
@@ -123,13 +123,13 @@ static int npu4_set_dpm(struct amdxdna_dev_hdl *ndev, u32 dpm_level)
 	return 0;
 }
 
-#ifdef HAVE_7_0_amd_pmf_get_npu_data
+#if IS_ENABLED(CONFIG_AMD_PMF) && defined(HAVE_7_0_amd_pmf_get_npu_data)
 static int npu4_update_counters(struct amdxdna_dev_hdl *ndev)
 {
 	struct amd_pmf_npu_metrics npu_metrics;
 	int ret;
 
-	ret = AIE2_GET_PMF_NPU_METRICS(&npu_metrics);
+	ret = AIE_GET_PMF_NPU_METRICS(&npu_metrics);
 	if (ret)
 		return ret;
 

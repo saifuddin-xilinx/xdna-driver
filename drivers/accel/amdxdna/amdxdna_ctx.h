@@ -21,31 +21,8 @@
 #define HWCTX_MAX_TIMEOUT	60000 /* milliseconds */
 #define MAX_CHAIN_CMDBUF_SIZE	SZ_4K
 
-/* Common hardware context private data - generic across all hardware */
-struct amdxdna_hwctx_priv {
-	void				*mbox_chann;
-
-	struct drm_gpu_scheduler	sched;
-	struct drm_sched_entity		entity;
-
-	struct mutex			io_lock; /* protect seq and cmd order */
-	struct wait_queue_head		job_free_wq;
-	u32				num_pending;
-	u64				seq;
-	struct semaphore		job_sem;
-	bool				job_done;
-
-	/* Completed job counter */
-	u64				completed;
-
-	struct amdxdna_gem_obj		*cmd_buf[HWCTX_MAX_CMDS];
-	struct drm_syncobj		*syncobj;
-
-	struct amdxdna_gem_obj		*last_pinned_chunk;
-
-	/* Hardware-specific private data pointer */
-	void				*hw_priv;
-};
+/* Forward declaration - platform-specific definitions in aie{2,4}_pci.h */
+struct amdxdna_hwctx_priv;
 
 enum ert_cmd_opcode {
 	ERT_START_CU = 0,
@@ -239,6 +216,7 @@ int amdxdna_cmd_set_error(struct amdxdna_gem_obj *abo,
 void amdxdna_sched_job_cleanup(struct amdxdna_sched_job *job);
 void amdxdna_hwctx_remove_all(struct amdxdna_client *client);
 int amdxdna_hwctx_walk(struct amdxdna_client *client, void *arg,
+		       bool (*filter)(struct amdxdna_hwctx *hwctx, void *arg),
 		       int (*walk)(struct amdxdna_hwctx *hwctx, void *arg));
 int amdxdna_hwctx_sync_debug_bo(struct amdxdna_client *client, u32 debug_bo_hdl);
 

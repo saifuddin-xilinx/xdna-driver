@@ -44,33 +44,6 @@
 	pci_resource_len(NDEV2PDEV(_ndev), (_ndev)->aie.xdna->dev_info->mbox_bar); \
 })
 
-#if IS_ENABLED(CONFIG_AMD_PMF) && defined(HAVE_7_0_amd_pmf_get_npu_data)
-#define AIE2_GET_PMF_NPU_METRICS(metrics) amd_pmf_get_npu_data(metrics)
-#define AIE2_GET_PMF_NPU_DATA(field, val)				\
-({									\
-	struct amd_pmf_npu_metrics _npu_metrics;			\
-	int _ret;							\
-									\
-	_ret = amd_pmf_get_npu_data(&_npu_metrics);			\
-	val = _ret ? U32_MAX : _npu_metrics.field;			\
-	(_ret);								\
-})
-#else
-#define AIE2_GET_PMF_NPU_METRICS(metrics)				\
-({									\
-	typeof(metrics) _m = metrics;					\
-	memset(_m, 0xff, sizeof(*_m));					\
-	(-EOPNOTSUPP);							\
-})
-
-#define SENSOR_DEFAULT_npu_power	U32_MAX
-#define AIE2_GET_PMF_NPU_DATA(field, val)				\
-({									\
-	val = SENSOR_DEFAULT_##field;					\
-	(-EOPNOTSUPP);							\
-})
-#endif
-
 enum aie2_sram_reg_idx {
 	MBOX_CHANN_OFF = 0,
 	FW_ALIVE_OFF,
@@ -99,6 +72,34 @@ struct rt_config {
 struct dpm_clk_freq {
 	u32	npuclk;
 	u32	hclk;
+};
+
+/*
+ * Define the maximum number of pending commands in a hardware context.
+ * Must be power of 2!
+ */
+#define HWCTX_MAX_CMDS		4
+#define get_job_idx(seq) ((seq) & (HWCTX_MAX_CMDS - 1))
+struct amdxdna_hwctx_priv {
+	void				*mbox_chann;
+
+	struct drm_gpu_scheduler	sched;
+	struct drm_sched_entity		entity;
+
+	struct mutex			io_lock; /* protect seq and cmd order */
+	struct wait_queue_head		job_free_wq;
+	u32				num_pending;
+	u64				seq;
+	struct semaphore		job_sem;
+	bool				job_done;
+
+	/* Completed job counter */
+	u64				completed;
+
+	struct amdxdna_gem_obj		*cmd_buf[HWCTX_MAX_CMDS];
+	struct drm_syncobj		*syncobj;
+
+	struct amdxdna_gem_obj		*last_pinned_chunk;
 };
 
 /* AIE2-specific hardware context private data */
@@ -194,6 +195,7 @@ enum aie2_fw_feature {
 	AIE2_UPDATE_PROPERTY,
 	AIE2_GET_DEV_REVISION,
 	AIE2_GET_COREDUMP,
+	AIE2_RW_ACCESS,
 	AIE2_FEATURE_MAX
 };
 
@@ -260,9 +262,14 @@ int aie2_query_firmware_version(struct amdxdna_dev_hdl *ndev,
 int aie2_query_app_health(struct amdxdna_dev_hdl *ndev, u32 context_id,
 			  struct app_health_report *report);
 int aie2_get_dev_revision(struct amdxdna_dev_hdl *ndev, enum aie2_dev_revision *rev);
-int aie2_get_aie_coredump(struct amdxdna_dev *xdna,
+int aie2_get_aie_coredump(struct amdxdna_hwctx *hwctx,
 			  struct amdxdna_msg_buf_hdl *list_hdl,
-			  struct amdxdna_hwctx *hwctx, u32 num_bufs);
+			  u32 num_bufs);
+int aie2_rw_aie_reg(struct amdxdna_hwctx *hwctx, bool is_read,
+		    u8 row, u8 col, u32 addr, u32 *value);
+int aie2_rw_aie_mem(struct amdxdna_hwctx *hwctx, bool is_read,
+		    u8 row, u8 col, u32 aie_addr,
+		    dma_addr_t dram_addr, u32 size);
 int aie2_create_context(struct amdxdna_dev_hdl *ndev, struct amdxdna_hwctx *hwctx);
 int aie2_destroy_context(struct amdxdna_dev_hdl *ndev, struct amdxdna_hwctx *hwctx);
 int aie2_map_host_buf(struct amdxdna_dev_hdl *ndev, u32 context_id, u64 addr, u64 size);
@@ -298,6 +305,7 @@ void aie2_hwctx_suspend(struct amdxdna_client *client);
 int aie2_hwctx_resume(struct amdxdna_client *client);
 int aie2_cmd_submit(struct amdxdna_hwctx *hwctx, struct amdxdna_sched_job *job, u64 *seq);
 int aie2_hwctx_heap_expand(struct amdxdna_hwctx *hwctx);
+void aie2_hmm_invalidate(struct amdxdna_gem_obj *abo, unsigned long cur_seq);
 
 /* TDR APIs */
 #ifndef HAVE_6_17_drm_gpu_sched_stat_no_hang

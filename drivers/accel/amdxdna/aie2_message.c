@@ -374,7 +374,8 @@ int aie2_query_status(struct amdxdna_dev_hdl *ndev, char __user *buf,
 
 	/* Go through each hardware context and mark the AIE columns that are active */
 	list_for_each_entry(client, &xdna->client_list, node)
-		amdxdna_hwctx_walk(client, &aie_bitmap, amdxdna_hwctx_col_map);
+		amdxdna_hwctx_walk(client, &aie_bitmap, NULL,
+				   amdxdna_hwctx_col_map);
 
 	*cols_filled = 0;
 	req.dump_buff_addr = to_dma_addr(buf_hdl, 0);
@@ -382,7 +383,7 @@ int aie2_query_status(struct amdxdna_dev_hdl *ndev, char __user *buf,
 	req.num_cols = hweight32(aie_bitmap);
 	req.aie_bitmap = aie_bitmap;
 
-	amdxdna_clflush_msg_buff(buf_hdl, 0, 0);
+	drm_clflush_virt_range(to_cpu_addr(buf_hdl, 0), to_buf_size(buf_hdl));
 	ret = aie_send_mgmt_msg_wait(&ndev->aie, &msg);
 	if (ret) {
 		XDNA_ERR(xdna, "Error during NPU query, status %d", ret);
@@ -432,7 +433,7 @@ int aie2_query_telemetry(struct amdxdna_dev_hdl *ndev,
 	req.buf_size = to_buf_size(buf_hdl);
 	req.type = header->type;
 
-	amdxdna_clflush_msg_buff(buf_hdl, 0, 0);
+	drm_clflush_virt_range(to_cpu_addr(buf_hdl, 0), to_buf_size(buf_hdl));
 	ret = aie_send_mgmt_msg_wait(&ndev->aie, &msg);
 	if (ret) {
 		XDNA_ERR(xdna, "Query telemetry failed, status %d", ret);
@@ -908,6 +909,14 @@ void aie2_msg_init(struct amdxdna_dev_hdl *ndev)
 		ndev->exec_msg_ops = &npu_exec_message_ops;
 	else
 		ndev->exec_msg_ops = &legacy_exec_message_ops;
+
+	if (AIE_FEATURE_ON(&ndev->aie, AIE2_GET_COREDUMP))
+		ndev->aie.msg_ops.get_coredump = aie2_get_aie_coredump;
+
+	if (AIE_FEATURE_ON(&ndev->aie, AIE2_RW_ACCESS)) {
+		ndev->aie.msg_ops.rw_reg = aie2_rw_aie_reg;
+		ndev->aie.msg_ops.rw_mem = aie2_rw_aie_mem;
+	}
 }
 
 static inline struct amdxdna_gem_obj *
@@ -1173,7 +1182,7 @@ int aie2_query_app_health(struct amdxdna_dev_hdl *ndev, u32 context_id,
 	req.context_id = context_id;
 	req.buf_size = to_buf_size(buf_hdl);
 
-	amdxdna_clflush_msg_buff(buf_hdl, 0, 0);
+	drm_clflush_virt_range(to_cpu_addr(buf_hdl, 0), sizeof(*report));
 	ret = aie_send_mgmt_msg_wait(&ndev->aie, &msg);
 	if (ret) {
 		XDNA_ERR(xdna, "Get app health failed, ret %d status 0x%x", ret, resp.status);
@@ -1257,18 +1266,14 @@ int aie2_get_dev_revision(struct amdxdna_dev_hdl *ndev, enum aie2_dev_revision *
 	return 0;
 }
 
-int aie2_get_aie_coredump(struct amdxdna_dev *xdna,
+int aie2_get_aie_coredump(struct amdxdna_hwctx *hwctx,
 			  struct amdxdna_msg_buf_hdl *list_hdl,
-			  struct amdxdna_hwctx *hwctx, u32 num_bufs)
+			  u32 num_bufs)
 {
-	struct amdxdna_dev_hdl *ndev = xdna->dev_handle;
 	DECLARE_AIE_MSG(get_coredump, MSG_OP_GET_COREDUMP);
+	struct amdxdna_dev_hdl *ndev = hwctx->client->xdna->dev_handle;
+	struct amdxdna_dev *xdna = hwctx->client->xdna;
 	int ret;
-
-	if (!AIE_FEATURE_ON(&ndev->aie, AIE2_GET_COREDUMP)) {
-		XDNA_DBG(xdna, "Get coredump unsupported for the device or firmware version");
-		return -EOPNOTSUPP;
-	}
 
 	req.context_id = hwctx->fw_ctx_id;
 	req.num_bufs = num_bufs;
@@ -1285,4 +1290,66 @@ int aie2_get_aie_coredump(struct amdxdna_dev *xdna,
 	}
 
 	return ret;
+}
+
+int aie2_rw_aie_reg(struct amdxdna_hwctx *hwctx, bool is_read,
+		    u8 row, u8 col, u32 addr, u32 *value)
+{
+	DECLARE_AIE_MSG(aie_rw_access, MSG_OP_AIE_RW_ACCESS);
+	struct amdxdna_dev_hdl *ndev = hwctx->client->xdna->dev_handle;
+	struct amdxdna_dev *xdna = hwctx->client->xdna;
+	enum aie2_access_type type;
+	int ret;
+
+	type = is_read ? AIE2_ACCESS_TYPE_REG_READ : AIE2_ACCESS_TYPE_REG_WRITE;
+
+	req.type = type;
+	req.ctx_id = hwctx->fw_ctx_id;
+	req.row = row;
+	req.col = col;
+	req.reg.aie_offset = addr;
+	if (!is_read)
+		req.reg.write_value = *value;
+
+	ret = aie_send_mgmt_msg_wait(&ndev->aie, &msg);
+	if (ret) {
+		XDNA_ERR(xdna, "AIE reg %s failed, ret %d",
+			 is_read ? "read" : "write", ret);
+		return ret;
+	}
+
+	if (is_read)
+		*value = resp.reg_read_value;
+
+	return 0;
+}
+
+int aie2_rw_aie_mem(struct amdxdna_hwctx *hwctx, bool is_read,
+		    u8 row, u8 col, u32 aie_addr,
+		    dma_addr_t dram_addr, u32 size)
+{
+	DECLARE_AIE_MSG(aie_rw_access, MSG_OP_AIE_RW_ACCESS);
+	struct amdxdna_dev_hdl *ndev = hwctx->client->xdna->dev_handle;
+	struct amdxdna_dev *xdna = hwctx->client->xdna;
+	enum aie2_access_type type;
+	int ret;
+
+	type = is_read ? AIE2_ACCESS_TYPE_MEM_READ : AIE2_ACCESS_TYPE_MEM_WRITE;
+
+	req.type = type;
+	req.ctx_id = hwctx->fw_ctx_id;
+	req.row = row;
+	req.col = col;
+	req.mem.aie_offset = aie_addr;
+	req.mem.dram_addr = dram_addr;
+	req.mem.size = size;
+
+	ret = aie_send_mgmt_msg_wait(&ndev->aie, &msg);
+	if (ret) {
+		XDNA_ERR(xdna, "AIE mem %s failed, ret %d",
+			 is_read ? "read" : "write", ret);
+		return ret;
+	}
+
+	return 0;
 }
