@@ -873,10 +873,6 @@ struct amdxdna_drm_set_power_mode {
 	DRM_IOWR(DRM_COMMAND_BASE + DRM_AMDXDNA_EXEC_CMD, \
 		 struct amdxdna_drm_exec_cmd)
 
-#define DRM_IOCTL_AMDXDNA_WAIT_CMD \
-	DRM_IOWR(DRM_COMMAND_BASE + DRM_AMDXDNA_WAIT_CMD, \
-		 struct amdxdna_drm_wait_cmd)
-
 #define DRM_IOCTL_AMDXDNA_GET_INFO \
 	DRM_IOWR(DRM_COMMAND_BASE + DRM_AMDXDNA_GET_INFO, \
 		 struct amdxdna_drm_get_info)
