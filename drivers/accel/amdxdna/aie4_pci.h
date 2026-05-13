@@ -21,7 +21,12 @@ struct cert_comp {
 	wait_queue_head_t               waitq;
 };
 
+/*
+ * AIE4 hardware context private data
+ * AIE4 does not use GPU scheduler, so no common base needed yet
+ */
 struct amdxdna_hwctx_priv {
+	/* AIE4-specific fields */
 	struct amdxdna_gem_obj          *umq_bo;
 	u64                             *umq_read_index;
 	u64                             *umq_write_index;
@@ -30,25 +35,37 @@ struct amdxdna_hwctx_priv {
 	u32                             hw_ctx_id;
 };
 
+/*
+ * AIE4-specific device private data
+ * Includes common fields (psp_regs_off, smu_regs_off) plus AIE4-specific fields
+ */
 struct amdxdna_dev_priv {
+	/* Common fields from amdxdna_dev_priv_common */
+	struct aie_bar_off_pair	psp_regs_off[PSP_MAX_REGS];
+	struct aie_bar_off_pair	smu_regs_off[SMU_MAX_REGS];
+
+	/* AIE4-specific fields */
 	const char              *npufw_path;
 	const char              *certfw_path;
 	u32			mbox_bar;
 	u32			mbox_rbuf_bar;
 	u64			mbox_info_off;
 	u32			doorbell_off;
-
-	struct aie_bar_off_pair	psp_regs_off[PSP_MAX_REGS];
-	struct aie_bar_off_pair	smu_regs_off[SMU_MAX_REGS];
 };
 
+/*
+ * AIE4-specific device handle
+ * First 4 fields match amdxdna_dev_hdl_common for compatibility
+ */
 struct amdxdna_dev_hdl {
+	/* Common fields - must match amdxdna_dev_hdl_common */
 	struct aie_device		aie;
 	const struct amdxdna_dev_priv	*priv;
 	void			__iomem *mbox_base;
-	void			__iomem *rbuf_base;
-
 	struct mailbox			*mbox;
+
+	/* AIE4-specific fields */
+	void			__iomem *rbuf_base;
 	u32				partition_id;
 
 	struct xarray                   cert_comp_xa; /* device level indexed by msix id */

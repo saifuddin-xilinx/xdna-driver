@@ -80,25 +80,26 @@ struct dpm_clk_freq {
  */
 #define HWCTX_MAX_CMDS		4
 #define get_job_idx(seq) ((seq) & (HWCTX_MAX_CMDS - 1))
+
+/*
+ * AIE2 hardware context private data
+ * Contains all fields needed for AIE2 operation
+ */
 struct amdxdna_hwctx_priv {
+	/* Common fields for amdxdna_ctx.c functions - MUST BE FIRST */
+	struct amdxdna_hwctx_priv_common priv_common;
+
+	/* AIE2-specific fields */
 	void				*mbox_chann;
-
-	struct drm_gpu_scheduler	sched;
-	struct drm_sched_entity		entity;
-
-	struct mutex			io_lock; /* protect seq and cmd order */
 	struct wait_queue_head		job_free_wq;
 	u32				num_pending;
 	u64				seq;
-	struct semaphore		job_sem;
 	bool				job_done;
 
 	/* Completed job counter */
 	u64				completed;
 
-	struct amdxdna_gem_obj		*cmd_buf[HWCTX_MAX_CMDS];
-	struct drm_syncobj		*syncobj;
-
+	u32				req_dpm_level;
 	struct amdxdna_gem_obj		*last_pinned_chunk;
 };
 
@@ -134,11 +135,19 @@ struct aie2_tdr {
 #endif
 };
 
+/*
+ * AIE2-specific device handle
+ * First 4 fields match amdxdna_dev_hdl_common for compatibility
+ */
 struct amdxdna_dev_hdl {
+	/* Common fields - must match amdxdna_dev_hdl_common */
 	struct aie_device		aie;
 	const struct amdxdna_dev_priv	*priv;
-	void			__iomem *sram_base;
 	void			__iomem *mbox_base;
+	struct mailbox			*mbox;
+
+	/* AIE2-specific fields */
+	void			__iomem *sram_base;
 
 	u32				total_col;
 	struct aie_version		version;
@@ -149,6 +158,8 @@ struct amdxdna_dev_hdl {
 	u32				dpm_level;
 	u32				dft_dpm_level;
 	u32				max_dpm_level;
+#define DPM_MAX_LEVELS			8
+	u32				dpm_refcnt[DPM_MAX_LEVELS];
 	u32				clk_gating;
 	u32				npuclk_freq;
 	u32				hclk_freq;
@@ -158,7 +169,6 @@ struct amdxdna_dev_hdl {
 	u32				frame_boundary_preempt;
 
 	/* Mailbox and the management channel */
-	struct mailbox			*mbox;
 	struct async_events		*async_events;
 
 	enum aie2_dev_status		dev_status;
@@ -196,7 +206,16 @@ enum aie2_fw_feature {
 
 #define AIE2_ALL_FEATURES	GENMASK_ULL(AIE2_FEATURE_MAX - 1, AIE2_NPU_COMMAND)
 
+/*
+ * AIE2-specific device private data
+ * Includes common fields (psp_regs_off, smu_regs_off) plus AIE2-specific fields
+ */
 struct amdxdna_dev_priv {
+	/* Common fields from amdxdna_dev_priv_common */
+	struct aie_bar_off_pair		psp_regs_off[PSP_MAX_REGS];
+	struct aie_bar_off_pair		smu_regs_off[SMU_MAX_REGS];
+
+	/* AIE2-specific fields */
 	const char			*fw_path;
 	const struct rt_config		*rt_config;
 	const struct dpm_clk_freq	*dpm_clk_tbl;
@@ -211,8 +230,6 @@ struct amdxdna_dev_priv {
 	u32				hwctx_limit;
 	u32				sram_dev_addr;
 	struct aie_bar_off_pair		sram_offs[SRAM_MAX_INDEX];
-	struct aie_bar_off_pair		psp_regs_off[PSP_MAX_REGS];
-	struct aie_bar_off_pair		smu_regs_off[SMU_MAX_REGS];
 	const struct aie2_hw_ops	*hw_ops;
 };
 
@@ -234,6 +251,10 @@ extern const struct aie2_hw_ops npu4_hw_ops;
 int aie2_pm_start(struct amdxdna_dev_hdl *ndev);
 int aie2_pm_set_mode(struct amdxdna_dev_hdl *ndev, enum amdxdna_power_mode_type target);
 int aie2_pm_set_dpm(struct amdxdna_dev_hdl *ndev, u32 dpm_level);
+int aie2_pm_update_dpm_ref(struct amdxdna_dev_hdl *ndev, u32 level, bool add);
+#define aie2_pm_request_dpm_level(ndev, level)	aie2_pm_update_dpm_ref(ndev, level, true)
+#define aie2_pm_release_dpm_level(ndev, level)	aie2_pm_update_dpm_ref(ndev, level, false)
+u32 aie2_pm_calc_dpm_level(struct amdxdna_dev_hdl *ndev, u32 opc, struct amdxdna_qos_info *qos);
 
 /* aie2_error.c */
 int aie2_error_async_events_alloc(struct amdxdna_dev_hdl *ndev);

@@ -10,6 +10,7 @@
 #include <drm/drm_gem.h>
 #include <drm/drm_gem_shmem_helper.h>
 #include <drm/drm_print.h>
+#include <drm/drm_syncobj.h>
 #include <drm/gpu_scheduler.h>
 #include <linux/xarray.h>
 #include "trace/events/amdxdna.h"
@@ -754,7 +755,7 @@ int amdxdna_hwctx_col_list(struct amdxdna_hwctx *hwctx, u32 row_count,
 }
 
 int amdxdna_hwctx_priv_init(struct amdxdna_hwctx *hwctx,
-			    struct amdxdna_hwctx_priv *priv,
+			    struct amdxdna_hwctx_priv_common *priv_common,
 			    const struct drm_sched_backend_ops *sched_ops,
 			    u32 timeout_ms)
 {
@@ -773,15 +774,14 @@ int amdxdna_hwctx_priv_init(struct amdxdna_hwctx *hwctx,
 	struct drm_gpu_scheduler *sched;
 	int i, ret;
 
-        if (!priv) {
-                XDNA_ERR(xdna, "Invalid hwctx priv");
+        if (!priv_common) {
+                XDNA_ERR(xdna, "Invalid hwctx priv_common");
                 return -EINVAL;
         }
 
-	hwctx->priv = priv;
-	sema_init(&priv->job_sem, HWCTX_MAX_CMDS);
+	sema_init(&priv_common->job_sem, HWCTX_MAX_CMDS);
 
-	for (i = 0; i < ARRAY_SIZE(priv->cmd_buf); i++) {
+	for (i = 0; i < HWCTX_MAX_CMDS; i++) {
 		struct amdxdna_gem_obj *abo;
 		struct amdxdna_drm_create_bo args = {
 			.flags = 0,
@@ -798,14 +798,14 @@ int amdxdna_hwctx_priv_init(struct amdxdna_hwctx *hwctx,
 
 		XDNA_DBG(xdna, "Command buf %d addr 0x%llx size 0x%lx",
 			 i, abo->mem.dma_addr, abo->mem.size);
-		priv->cmd_buf[i] = abo;
+		priv_common->cmd_buf[i] = abo;
 	}
 
-	sched = &priv->sched;
-	mutex_init(&priv->io_lock);
+	sched = &priv_common->sched;
+	mutex_init(&priv_common->io_lock);
 
 	fs_reclaim_acquire(GFP_KERNEL);
-	might_lock(&priv->io_lock);
+	might_lock(&priv_common->io_lock);
 	fs_reclaim_release(GFP_KERNEL);
 #ifdef HAVE_6_15_drm_sched_init
 	ret = drm_sched_init(sched, &args);
@@ -820,7 +820,7 @@ int amdxdna_hwctx_priv_init(struct amdxdna_hwctx *hwctx,
 		goto free_cmd_bufs;
 	}
 
-	ret = drm_sched_entity_init(&priv->entity, DRM_SCHED_PRIORITY_NORMAL,
+	ret = drm_sched_entity_init(&priv_common->entity, DRM_SCHED_PRIORITY_NORMAL,
 				    &sched, 1, NULL);
 	if (ret) {
 		XDNA_ERR(xdna, "Failed to initial sched entiry. ret %d", ret);
@@ -830,67 +830,70 @@ int amdxdna_hwctx_priv_init(struct amdxdna_hwctx *hwctx,
 	return 0;
 
 free_sched:
-	drm_sched_fini(&priv->sched);
+	drm_sched_fini(&priv_common->sched);
 free_cmd_bufs:
-	for (i = 0; i < ARRAY_SIZE(priv->cmd_buf); i++) {
-		if (!priv->cmd_buf[i])
+	for (i = 0; i < HWCTX_MAX_CMDS; i++) {
+		if (!priv_common->cmd_buf[i])
 			break;
-		drm_gem_object_put(to_gobj(priv->cmd_buf[i]));
+		drm_gem_object_put(to_gobj(priv_common->cmd_buf[i]));
 	}
 	return ret;
 }
 
 void amdxdna_hwctx_priv_fini(struct amdxdna_hwctx *hwctx,
-			     struct amdxdna_hwctx_priv *priv)
+			     struct amdxdna_hwctx_priv_common *priv_common)
 {
 	int idx;
 
-	drm_sched_fini(&priv->sched);
+	drm_sched_fini(&priv_common->sched);
 
-	for (idx = 0; idx < ARRAY_SIZE(priv->cmd_buf); idx++)
-		drm_gem_object_put(to_gobj(priv->cmd_buf[idx]));
+	for (idx = 0; idx < HWCTX_MAX_CMDS; idx++)
+		drm_gem_object_put(to_gobj(priv_common->cmd_buf[idx]));
 
-	mutex_destroy(&priv->io_lock);
+	mutex_destroy(&priv_common->io_lock);
 	kfree(hwctx->col_list);
 }
 
 void amdxdna_hwctx_fini(struct amdxdna_hwctx *hwctx,
+			struct amdxdna_hwctx_priv_common *priv_common,
 			void (*release_resource)(struct amdxdna_hwctx *hwctx))
 {
 	struct amdxdna_dev *xdna = hwctx->client->xdna;
-	struct amdxdna_hwctx_priv *priv = hwctx->priv;
 
 	/* Stop scheduler, release hw resource, restart to drain pending jobs */
-	drm_sched_stop(&hwctx->priv->sched, NULL);
-	release_resource(hwctx);
+	if (priv_common) {
+		drm_sched_stop(&priv_common->sched, NULL);
+		release_resource(hwctx);
 #ifdef HAVE_6_13_drm_sched_start_errno
-	drm_sched_start(&hwctx->priv->sched, 0);
+		drm_sched_start(&priv_common->sched, 0);
 #elif defined(HAVE_6_10_drm_sched_start_full_recovery)
-	drm_sched_start(&hwctx->priv->sched, true);
+		drm_sched_start(&priv_common->sched, true);
 #else
-	drm_sched_start(&hwctx->priv->sched);
+		drm_sched_start(&priv_common->sched);
 #endif
+	}
 
 	mutex_unlock(&xdna->dev_lock);
-	drm_sched_entity_destroy(&hwctx->priv->entity);
+	if (priv_common)
+		drm_sched_entity_destroy(&priv_common->entity);
 
-	/* Wait for all submitted jobs to be completed or canceled */
-	wait_event(hwctx->priv->job_free_wq,
-		   atomic64_read(&hwctx->job_submit_cnt) ==
-		   atomic64_read(&hwctx->job_free_cnt));
 	mutex_lock(&xdna->dev_lock);
 
-	amdxdna_ctx_syncobj_destroy(hwctx);
-	amdxdna_hwctx_priv_fini(hwctx, priv);
+	amdxdna_ctx_syncobj_destroy(hwctx, priv_common);
+	amdxdna_hwctx_priv_fini(hwctx, priv_common);
 }
 
-int amdxdna_ctx_syncobj_create(struct amdxdna_hwctx *hwctx)
+int amdxdna_ctx_syncobj_create(struct amdxdna_hwctx *hwctx,
+			       struct amdxdna_hwctx_priv_common *priv_common)
 {
 	struct amdxdna_dev *xdna = hwctx->client->xdna;
 	struct drm_syncobj *syncobj;
 	struct drm_file *filp;
 	u32 hdl;
 	int ret;
+
+	if (!priv_common)
+		return -EINVAL;
 
 	filp = hwctx->client->filp;
 
@@ -907,17 +910,19 @@ int amdxdna_ctx_syncobj_create(struct amdxdna_hwctx *hwctx)
 		XDNA_ERR(xdna, "Create ctx syncobj handle failed, ret %d", ret);
 		return ret;
 	}
-	hwctx->priv->syncobj = syncobj;
+	priv_common->syncobj = syncobj;
 	hwctx->syncobj_hdl = hdl;
 
 	return 0;
 }
 
-void amdxdna_ctx_syncobj_destroy(struct amdxdna_hwctx *hwctx)
+void amdxdna_ctx_syncobj_destroy(struct amdxdna_hwctx *hwctx,
+				 struct amdxdna_hwctx_priv_common *priv_common)
 {
 	/*
 	 * The syncobj_hdl is owned by user space and will be cleaned up
 	 * separately.
 	 */
-	drm_syncobj_put(hwctx->priv->syncobj);
+	if (priv_common && priv_common->syncobj)
+		drm_syncobj_put(priv_common->syncobj);
 }

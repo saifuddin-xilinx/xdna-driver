@@ -9,8 +9,8 @@
 #include <drm/gpu_scheduler.h>
 #include <linux/bitfield.h>
 
+#include "amdxdna_aie.h"
 #include "amdxdna_gem.h"
-#include <drm/gpu_scheduler.h>
 
 /*
  * Define the maximum number of pending commands in a hardware context.
@@ -22,7 +22,57 @@
 #define HWCTX_MAX_TIMEOUT	60000 /* milliseconds */
 #define MAX_CHAIN_CMDBUF_SIZE	SZ_4K
 
-/* Forward declaration - platform-specific definitions in aie{2,4}_pci.h */
+/* Forward declarations */
+struct aie_device;
+struct mailbox;
+struct aie_bar_off_pair;
+
+/*
+ * Common device handle base structure
+ * Hardware-specific device handles (aie2/aie4) must have these fields
+ * in the same order at the beginning of their amdxdna_dev_hdl structure
+ */
+struct amdxdna_dev_hdl_common {
+	struct aie_device		aie;
+	const void			*priv; /* points to hw-specific dev_priv */
+	void			__iomem *mbox_base;
+	struct mailbox			*mbox;
+};
+
+/*
+ * Common device private data base structure
+ * Hardware-specific private data must include these fields
+ */
+struct amdxdna_dev_priv_common {
+	struct aie_bar_off_pair		*psp_regs_off;
+	struct aie_bar_off_pair		*smu_regs_off;
+};
+
+/* Forward declarations for GPU scheduler */
+struct drm_gpu_scheduler;
+struct drm_sched_entity;
+struct amdxdna_gem_obj;
+
+/*
+ * Common hardware context private data base structure
+ * Used by common amdxdna_ctx.c functions
+ * AIE2 embeds this in its amdxdna_hwctx_priv, AIE4 has its own structure
+ */
+struct amdxdna_hwctx_priv_common {
+	struct drm_gpu_scheduler	sched;
+	struct drm_sched_entity		entity;
+	struct mutex			io_lock; /* protect seq and cmd order */
+	struct semaphore		job_sem;
+	struct amdxdna_gem_obj		*cmd_buf[HWCTX_MAX_CMDS];
+	struct drm_syncobj		*syncobj;
+};
+
+/*
+ * Forward declaration for hardware context private data
+ * Platform-specific definitions in aie{2,4}_pci.h
+ * AIE2: Full structure with scheduler fields
+ * AIE4: Completely different structure, doesn't use priv_common base
+ */
 struct amdxdna_hwctx_priv;
 
 enum ert_cmd_opcode {
@@ -239,14 +289,17 @@ int amdxdna_drm_wait_cmd_ioctl(struct drm_device *dev, void *data, struct drm_fi
 int amdxdna_hwctx_col_list(struct amdxdna_hwctx *hwctx, u32 row_count,
 			   u32 total_col, bool natural_align);
 int amdxdna_hwctx_priv_init(struct amdxdna_hwctx *hwctx,
-			    struct amdxdna_hwctx_priv *priv,
+			    struct amdxdna_hwctx_priv_common *priv_common,
 			    const struct drm_sched_backend_ops *sched_ops,
 			    u32 timeout_ms);
 void amdxdna_hwctx_priv_fini(struct amdxdna_hwctx *hwctx,
-			     struct amdxdna_hwctx_priv *priv);
+			     struct amdxdna_hwctx_priv_common *priv_common);
 void amdxdna_hwctx_fini(struct amdxdna_hwctx *hwctx,
+			struct amdxdna_hwctx_priv_common *priv_common,
 			void (*release_resource)(struct amdxdna_hwctx *hwctx));
-int amdxdna_ctx_syncobj_create(struct amdxdna_hwctx *hwctx);
-void amdxdna_ctx_syncobj_destroy(struct amdxdna_hwctx *hwctx);
+int amdxdna_ctx_syncobj_create(struct amdxdna_hwctx *hwctx,
+			       struct amdxdna_hwctx_priv_common *priv_common);
+void amdxdna_ctx_syncobj_destroy(struct amdxdna_hwctx *hwctx,
+				 struct amdxdna_hwctx_priv_common *priv_common);
 
 #endif /* _AMDXDNA_CTX_H_ */

@@ -11,6 +11,7 @@
 #include "aie2_pci.h"
 #include "amdxdna_pci_drv.h"
 #include "amdxdna_pm.h"
+#include "amdxdna_solver.h"
 
 #define AIE2_CLK_GATING_ENABLE	1
 #define AIE2_CLK_GATING_DISABLE	0
@@ -126,4 +127,64 @@ int aie2_pm_set_mode(struct amdxdna_dev_hdl *ndev, enum amdxdna_power_mode_type 
 	ndev->pw_mode = target;
 
 	return 0;
+}
+
+int aie2_pm_update_dpm_ref(struct amdxdna_dev_hdl *ndev, u32 level, bool add)
+{
+	struct amdxdna_dev *xdna = ndev->aie.xdna;
+	int i, ret;
+
+	drm_WARN_ON(&xdna->ddev, !mutex_is_locked(&xdna->dev_lock));
+
+	if (level > ndev->max_dpm_level)
+		return -EINVAL;
+
+	if (add) {
+		ndev->dpm_refcnt[level]++;
+	} else {
+		if (!ndev->dpm_refcnt[level])
+			return -EINVAL;
+		ndev->dpm_refcnt[level]--;
+	}
+
+	/* Find highest DPM level in use */
+	ndev->dft_dpm_level = 0;
+	for (i = ndev->max_dpm_level; i >= 0; i--) {
+		if (ndev->dpm_refcnt[i]) {
+			ndev->dft_dpm_level = i;
+			break;
+		}
+	}
+
+	if (ndev->pw_mode != POWER_MODE_DEFAULT || ndev->dft_dpm_level == ndev->dpm_level)
+		return 0;
+
+	ret = ndev->priv->hw_ops->set_dpm(ndev, ndev->dft_dpm_level);
+	if (ret) {
+		if (add)
+			ndev->dpm_refcnt[level]--;
+		else
+			ndev->dpm_refcnt[level]++;
+		return ret;
+	}
+
+	ndev->dpm_level = ndev->dft_dpm_level;
+	return 0;
+}
+
+u32 aie2_pm_calc_dpm_level(struct amdxdna_dev_hdl *ndev, u32 opc, struct amdxdna_qos_info *qos)
+{
+	struct aie_qos rqos = { .gops = qos->gops, .fps = qos->fps, .latency = qos->latency };
+	u32 req_gops, level;
+
+	req_gops = xrs_get_gops(&rqos);
+	if (!req_gops)
+		return ndev->max_dpm_level;
+
+	for (level = 0; level <= ndev->max_dpm_level; level++) {
+		if (req_gops <= opc * ndev->priv->dpm_clk_tbl[level].hclk / 1000)
+			return level;
+	}
+
+	return ndev->max_dpm_level;
 }

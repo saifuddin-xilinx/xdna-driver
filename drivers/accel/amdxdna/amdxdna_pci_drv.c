@@ -102,14 +102,8 @@ static int amdxdna_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	if (!xdna->dev_info)
 		return -ENODEV;
 
-	drmm_mutex_init(ddev, &xdna->dev_lock);
-	init_rwsem(&xdna->notifier_lock);
-	INIT_LIST_HEAD(&xdna->client_list);
 	pci_set_drvdata(pdev, xdna);
-
-	ret = drmm_add_action(ddev, amdxdna_xdna_drm_release, xdna);
-	if (ret)
-		return ret;
+	init_rwsem(&xdna->notifier_lock);
 
 	if (IS_ENABLED(CONFIG_LOCKDEP)) {
 		fs_reclaim_acquire(GFP_KERNEL);

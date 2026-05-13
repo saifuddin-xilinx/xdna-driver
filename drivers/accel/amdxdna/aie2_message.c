@@ -924,7 +924,7 @@ aie2_cmdlist_get_cmd_buf(struct amdxdna_sched_job *job)
 {
 	int idx = get_job_idx(job->seq);
 
-	return job->hwctx->priv->cmd_buf[idx];
+	return job->hwctx->priv->priv_common.cmd_buf[idx];
 }
 
 int aie2_execbuf(struct amdxdna_hwctx *hwctx, struct amdxdna_sched_job *job,

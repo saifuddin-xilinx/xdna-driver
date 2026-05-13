@@ -306,9 +306,9 @@ u64 amdxdna_gem_dev_addr(struct amdxdna_gem_obj *abo)
 	return amdxdna_obj_dma_addr(abo);
 }
 
-static bool amdxdna_hmm_invalidate(struct mmu_interval_notifier *mni,
-				   const struct mmu_notifier_range *range,
-				   unsigned long cur_seq)
+static bool amdxdna_gem_hmm_invalidate(struct mmu_interval_notifier *mni,
+				       const struct mmu_notifier_range *range,
+				       unsigned long cur_seq)
 {
 	struct amdxdna_umap *mapp = container_of(mni, struct amdxdna_umap, notifier);
 	struct amdxdna_gem_obj *abo = mapp->abo;
@@ -343,7 +343,7 @@ static bool amdxdna_hmm_invalidate(struct mmu_interval_notifier *mni,
 }
 
 static const struct mmu_interval_notifier_ops amdxdna_hmm_ops = {
-	.invalidate = amdxdna_hmm_invalidate,
+	.invalidate = amdxdna_gem_hmm_invalidate,
 };
 
 static void amdxdna_hmm_unregister(struct amdxdna_gem_obj *abo,
