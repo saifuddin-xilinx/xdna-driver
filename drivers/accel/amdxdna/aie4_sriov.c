@@ -7,7 +7,7 @@
 #include <drm/drm_print.h>
 #include <linux/pci.h>
 
-#include "aie.h"
+#include "amdxdna_aie.h"
 #include "aie4_msg_priv.h"
 #include "aie4_pci.h"
 #include "amdxdna_mailbox.h"

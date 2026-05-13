@@ -16,7 +16,7 @@
 #include <linux/types.h>
 #include <linux/xarray.h>
 
-#include "aie.h"
+#include "amdxdna_aie.h"
 #include "aie2_msg_priv.h"
 #include "aie2_pci.h"
 #include "amdxdna_ctx.h"

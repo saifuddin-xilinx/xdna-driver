@@ -13,7 +13,8 @@
 #include <linux/limits.h>
 #include <linux/semaphore.h>
 
-#include "aie.h"
+#include "amdxdna_aie.h"
+#include "amdxdna_ctx.h"
 #include "aie2_msg_priv.h"
 #include "amdxdna_mailbox.h"
 

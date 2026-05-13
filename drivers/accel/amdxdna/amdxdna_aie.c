@@ -15,12 +15,12 @@
 #include <linux/slab.h>
 #include <linux/uaccess.h>
 
-#include "aie.h"
+#include "amdxdna_aie.h"
 #include "amdxdna_ctx.h"
 #include "amdxdna_gem.h"
 #include "amdxdna_mailbox_helper.h"
 #include "amdxdna_mailbox.h"
-#include "amdxdna_pci_drv.h"
+#include "amdxdna_drv.h"
 #include "amdxdna_pm.h"
 
 void aie_dump_mgmt_chann_debug(struct aie_device *aie)

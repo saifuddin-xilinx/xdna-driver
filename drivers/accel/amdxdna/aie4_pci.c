@@ -10,7 +10,7 @@
 #include <linux/firmware.h>
 #include <linux/sizes.h>
 
-#include "aie.h"
+#include "amdxdna_aie.h"
 #include "aie4_pci.h"
 #include "aie4_msg_priv.h"
 #include "amdxdna_mailbox.h"

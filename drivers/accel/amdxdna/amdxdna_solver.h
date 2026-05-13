@@ -3,10 +3,11 @@
  * Copyright (C) 2023-2026, Advanced Micro Devices, Inc.
  */
 
-#ifndef _AIE2_SOLVER_H
-#define _AIE2_SOLVER_H
+#ifndef _AMDXDNA_SOLVER_H
+#define _AMDXDNA_SOLVER_H
 
 #define XRS_MAX_COL 128
+#define DEFAULT_SYS_EFF_FACTOR  2
 
 /*
  * Structure used to describe a partition. A partition is column based
@@ -126,6 +127,9 @@ struct init_config {
  */
 void *xrsm_init(struct init_config *cfg);
 
+/* QoS helper functions shared with power management */
+u32 xrs_get_gops(struct aie_qos *rqos);
+
 /*
  * xrs_allocate_resource() - Request to allocate resources for a given context
  *                           and a partition metadata. (See struct part_meta)
@@ -152,4 +156,26 @@ int xrs_allocate_resource(void *hdl, struct alloc_requests *req, void *cb_arg);
  * @rid:	The Request ID to identify the requesting context
  */
 int xrs_release_resource(void *hdl, u64 rid);
-#endif /* _AIE2_SOLVER_H */
+
+/*
+ * Hardware context resource management helpers
+ */
+struct amdxdna_hwctx;
+
+/*
+ * amdxdna_alloc_resource() - Allocate AIE resources for a hardware context
+ *
+ * @hwctx:	Hardware context pointer
+ *
+ * Return:	0 when successful, or standard error number when failing
+ */
+int amdxdna_alloc_resource(struct amdxdna_hwctx *hwctx);
+
+/*
+ * amdxdna_release_resource() - Release AIE resources for a hardware context
+ *
+ * @hwctx:	Hardware context pointer
+ */
+void amdxdna_release_resource(struct amdxdna_hwctx *hwctx);
+
+#endif /* _AMDXDNA_SOLVER_H */

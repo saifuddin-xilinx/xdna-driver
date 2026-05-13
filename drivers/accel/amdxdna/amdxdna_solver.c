@@ -3,14 +3,18 @@
  * Copyright (C) 2022-2026, Advanced Micro Devices, Inc.
  */
 
+#include "drm/amdxdna_accel.h"
 #include <drm/drm_device.h>
 #include <drm/drm_managed.h>
 #include <drm/drm_print.h>
+#include <drm/gpu_scheduler.h>
 #include <linux/bitops.h>
 #include <linux/bitmap.h>
 #include <linux/slab.h>
 
-#include "aie2_solver.h"
+#include "amdxdna_ctx.h"
+#include "amdxdna_drv.h"
+#include "amdxdna_solver.h"
 
 struct partition_node {
 	struct list_head	list;
@@ -107,6 +111,14 @@ static bool is_valid_qos_dpm_params(struct aie_qos *rqos)
 		return true;
 
 	return false;
+}
+
+u32 xrs_get_gops(struct aie_qos *rqos)
+{
+	if (!is_valid_qos_dpm_params(rqos))
+		return 0;
+
+	return calculate_gops(rqos) * DEFAULT_SYS_EFF_FACTOR;
 }
 
 static int set_dpm_level(struct solver_state *xrs, struct alloc_requests *req, u32 *dpm_level)
@@ -385,4 +397,46 @@ void *xrsm_init(struct init_config *cfg)
 	INIT_LIST_HEAD(&rgp->pt_node_list);
 
 	return xrs;
+}
+
+int amdxdna_alloc_resource(struct amdxdna_hwctx *hwctx)
+{
+	struct amdxdna_dev *xdna = hwctx->client->xdna;
+	struct alloc_requests *xrs_req;
+	int ret;
+
+	xrs_req = kzalloc(sizeof(*xrs_req), GFP_KERNEL);
+	if (!xrs_req)
+		return -ENOMEM;
+
+	xrs_req->cdo.start_cols = hwctx->col_list;
+	xrs_req->cdo.cols_len = hwctx->col_list_len;
+	xrs_req->cdo.ncols = hwctx->num_col;
+	xrs_req->cdo.qos_cap.opc = hwctx->max_opc;
+
+	xrs_req->rqos.gops = hwctx->qos.gops;
+	xrs_req->rqos.fps = hwctx->qos.fps;
+	xrs_req->rqos.dma_bw = hwctx->qos.dma_bandwidth;
+	xrs_req->rqos.latency = hwctx->qos.latency;
+	xrs_req->rqos.exec_time = hwctx->qos.frame_exec_time;
+	xrs_req->rqos.priority = hwctx->qos.priority;
+
+	xrs_req->rid = (uintptr_t)hwctx;
+
+	ret = xrs_allocate_resource(xdna->xrs_hdl, xrs_req, hwctx);
+	if (ret)
+		drm_err(&xdna->ddev, "Allocate AIE resource failed, ret %d", ret);
+
+	kfree(xrs_req);
+	return ret;
+}
+
+void amdxdna_release_resource(struct amdxdna_hwctx *hwctx)
+{
+	struct amdxdna_dev *xdna = hwctx->client->xdna;
+	int ret;
+
+	ret = xrs_release_resource(xdna->xrs_hdl, (uintptr_t)hwctx);
+	if (ret)
+		drm_err(&xdna->ddev, "Release AIE resource failed, ret %d", ret);
 }

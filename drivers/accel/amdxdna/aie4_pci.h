@@ -10,7 +10,7 @@
 #include <linux/iopoll.h>
 #include <linux/pci.h>
 
-#include "aie.h"
+#include "amdxdna_aie.h"
 #include "amdxdna_mailbox.h"
 
 struct cert_comp {
