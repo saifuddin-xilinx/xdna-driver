@@ -19,7 +19,7 @@
 #include <linux/xarray.h>
 #include <asm/hypervisor.h>
 
-#include "aie.h"
+#include "amdxdna_aie.h"
 #include "aie2_msg_priv.h"
 #include "aie2_pci.h"
 #include "amdxdna_solver.h"

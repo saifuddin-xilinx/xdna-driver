@@ -611,8 +611,10 @@ static const struct drm_sched_backend_ops sched_ops = {
 static int aie2_hwctx_col_list(struct amdxdna_hwctx *hwctx)
 {
 	struct amdxdna_dev *xdna = hwctx->client->xdna;
-	struct amdxdna_dev_hdl *ndev = xdna->dev_handle;
-	bool natural_align;
+	struct amdxdna_dev_hdl *ndev;
+	int start, end, first, last;
+	u32 width = 1, entries = 0;
+	int i;
 
 	if (!hwctx->num_tiles) {
 		XDNA_ERR(xdna, "Number of tiles is zero");
@@ -725,7 +727,38 @@ static void aie2_release_resource(struct amdxdna_hwctx *hwctx)
 
 static int aie2_ctx_syncobj_create(struct amdxdna_hwctx *hwctx)
 {
-	return amdxdna_ctx_syncobj_create(hwctx);
+	struct amdxdna_dev *xdna = hwctx->client->xdna;
+	struct drm_file *filp = hwctx->client->filp;
+	struct drm_syncobj *syncobj;
+	u32 hdl;
+	int ret;
+
+	hwctx->syncobj_hdl = AMDXDNA_INVALID_FENCE_HANDLE;
+
+	ret = drm_syncobj_create(&syncobj, 0, NULL);
+	if (ret) {
+		XDNA_ERR(xdna, "Create ctx syncobj failed, ret %d", ret);
+		return ret;
+	}
+	ret = drm_syncobj_get_handle(filp, syncobj, &hdl);
+	if (ret) {
+		drm_syncobj_put(syncobj);
+		XDNA_ERR(xdna, "Create ctx syncobj handle failed, ret %d", ret);
+		return ret;
+	}
+	hwctx->priv->syncobj = syncobj;
+	hwctx->syncobj_hdl = hdl;
+
+	return 0;
+}
+
+static void aie2_ctx_syncobj_destroy(struct amdxdna_hwctx *hwctx)
+{
+	/*
+	 * The syncobj_hdl is owned by user space and will be cleaned up
+	 * separately.
+	 */
+	drm_syncobj_put(hwctx->priv->syncobj);
 }
 
 int aie2_hwctx_init(struct amdxdna_hwctx *hwctx)
@@ -796,23 +829,21 @@ int aie2_hwctx_init(struct amdxdna_hwctx *hwctx)
 			     NULL, NULL, "amdxdna_js", xdna->ddev.dev);
 #endif
 	if (ret) {
-		XDNA_ERR(xdna, "Initialize hwctx priv failed, ret %d", ret);
-		kfree(aie2_priv);
-		kfree(priv);
-		return ret;
+		XDNA_ERR(xdna, "Failed to init DRM scheduler. ret %d", ret);
+		goto free_cmd_bufs;
 	}
 
 	ret = drm_sched_entity_init(&priv->entity, DRM_SCHED_PRIORITY_NORMAL,
 				    &sched, 1, NULL);
 	if (ret) {
-		XDNA_ERR(xdna, "Failed to initialize sched entity. ret %d", ret);
+		XDNA_ERR(xdna, "Failed to initial sched entiry. ret %d", ret);
 		goto free_sched;
 	}
 
 	ret = aie2_hwctx_col_list(hwctx);
 	if (ret) {
 		XDNA_ERR(xdna, "Create col list failed, ret %d", ret);
-		goto fini_priv;
+		goto free_entity;
 	}
 
 	ret = amdxdna_pm_resume_get_locked(xdna);
@@ -868,8 +899,10 @@ free_cmd_bufs:
 
 void aie2_hwctx_fini(struct amdxdna_hwctx *hwctx)
 {
-	struct amdxdna_dev *xdna = hwctx->client->xdna;
-	struct amdxdna_hwctx_priv *priv = hwctx->priv;
+	struct amdxdna_dev *xdna;
+	int idx;
+
+	xdna = hwctx->client->xdna;
 
 	XDNA_DBG(xdna, "%s sequence number %lld", hwctx->name, hwctx->priv->seq);
 	aie2_hwctx_wait_for_idle(hwctx);
@@ -1326,4 +1359,19 @@ int aie2_hwctx_heap_expand(struct amdxdna_hwctx *hwctx)
 	}
 
 	return 0;
+}
+
+void aie2_hmm_invalidate(struct amdxdna_gem_obj *abo,
+			 unsigned long cur_seq)
+{
+	struct amdxdna_dev *xdna = to_xdna_dev(to_gobj(abo)->dev);
+	struct drm_gem_object *gobj = to_gobj(abo);
+	long ret;
+
+	ret = dma_resv_wait_timeout(gobj->resv, DMA_RESV_USAGE_BOOKKEEP,
+				    true, MAX_SCHEDULE_TIMEOUT);
+	if (!ret)
+		XDNA_ERR(xdna, "Failed to wait for bo, ret %ld", ret);
+	else if (ret == -ERESTARTSYS)
+		XDNA_DBG(xdna, "Wait for bo interrupted by signal");
 }

@@ -11,7 +11,7 @@
 #include <drm/gpu_scheduler.h>
 #include <linux/types.h>
 
-#include "aie.h"
+#include "amdxdna_aie.h"
 #include "aie4_host_queue.h"
 #include "aie4_pci.h"
 #include "aie4_msg_priv.h"

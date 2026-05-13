@@ -8,8 +8,10 @@
 
 #include "drm/amdxdna_accel.h"
 #include <drm/drm_device.h>
+#include <drm/drm_file.h>
 #include <drm/drm_print.h>
 #include <linux/capability.h>
+#include <linux/cred.h>
 #include <linux/iommu.h>
 #include <linux/iova.h>
 #include <linux/workqueue.h>
@@ -40,11 +42,6 @@
 	((struct amdxdna_dev *)container_of(drm_dev, struct amdxdna_dev, ddev))
 
 extern const struct drm_driver amdxdna_drm_drv;
-
-static inline bool amdxdna_is_admin(void)
-{
-	return capable(CAP_SYS_ADMIN);
-}
 
 struct amdxdna_client;
 struct amdxdna_dev;
@@ -216,6 +213,7 @@ struct amdxdna_client {
 
 /* Add device info below */
 extern const struct amdxdna_dev_info dev_npu1_info;
+extern const struct amdxdna_dev_info dev_npu3_classic_info;
 extern const struct amdxdna_dev_info dev_npu3_pf_info;
 extern const struct amdxdna_dev_info dev_npu3_vf_info;
 extern const struct amdxdna_dev_info dev_npu4_info;
@@ -248,6 +246,18 @@ static inline bool amdxdna_iova_on(struct amdxdna_dev *xdna)
 static inline bool amdxdna_pasid_on(struct amdxdna_client *client)
 {
 	return client->pasid != IOMMU_PASID_INVALID;
+}
+
+static inline bool amdxdna_is_admin(void)
+{
+	return capable(CAP_SYS_ADMIN);
+}
+
+/* True if the current task may examine @client's contexts. */
+static inline bool amdxdna_client_visible(struct amdxdna_client *client)
+{
+	return capable(CAP_SYS_ADMIN) ||
+	       uid_eq(current_euid(), client->filp->filp->f_cred->euid);
 }
 
 #endif /* _AMDXDNA_DRV_H_ */
