@@ -125,8 +125,8 @@ int amdxdna_drm_create_hwctx_ioctl(struct drm_device *dev, void *data, struct dr
 	ctx->syncobj = NULL;
 	ctx->syncobj_hdl = AMDXDNA_INVALID_FENCE_HANDLE;
 	mutex_init(&ctx->io_lock);
-	fs_reclaim_acquire(GFP_KERNEL);
-	might_lock(&ctx->io_lock);
+fs_reclaim_acquire(GFP_KERNEL);
+might_lock(&ctx->io_lock);
 fs_reclaim_release(GFP_KERNEL);
 atomic64_set(&ctx->job_free_cnt, 0);
 132
@@ -181,9 +181,9 @@ kfree(ctx);
 drm_dev_exit(idx);
 return ret;
 183}
-	trace_amdxdna_debug_point(current->comm, client->pid, "destroy hwctx");
-
-	if (!drm_dev_enter(dev, &idx))
+184
+if (!drm_dev_enter(dev, &idx))
+	return -ENODEV;
 		return -ENODEV;
 
 	ctx = xa_erase(&client->ctx_xa, args->handle);
