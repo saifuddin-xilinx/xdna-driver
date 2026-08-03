@@ -473,6 +473,7 @@ static void amdxdna_gem_dev_obj_free(struct drm_gem_object *gobj)
 {
 	struct amdxdna_dev *xdna = to_xdna_dev(gobj->dev);
 	struct amdxdna_gem_obj *abo = to_xdna_obj(gobj);
+	struct amdxdna_client *client = abo->client;
 
 	XDNA_DBG(xdna, "BO type %d xdna_addr 0x%llx", abo->type, amdxdna_gem_dev_addr(abo));
 	if (abo->flags & BO_SUBMIT_PINNED)
@@ -482,9 +483,8 @@ static void amdxdna_gem_dev_obj_free(struct drm_gem_object *gobj)
 	amdxdna_gem_heap_free(abo);
 	drm_gem_object_release(gobj);
 	amdxdna_gem_destroy_obj(abo);
+	amdxdna_client_put(client);
 }
-
-static void amdxdna_imported_obj_free(struct amdxdna_gem_obj *abo)
 {
 	dma_buf_unmap_attachment_unlocked(abo->attach, abo->base.sgt, DMA_BIDIRECTIONAL);
 	dma_buf_detach(abo->dma_buf, abo->attach);
@@ -1103,6 +1103,7 @@ amdxdna_drm_create_dev_bo(struct drm_device *dev, struct amdxdna_drm_create_bo *
 
 	abo->type = AMDXDNA_BO_DEV;
 	abo->client = client;
+	kref_get(&client->refcnt);
 
 	ret = amdxdna_gem_heap_alloc(abo);
 	if (ret) {
@@ -1111,7 +1112,6 @@ amdxdna_drm_create_dev_bo(struct drm_device *dev, struct amdxdna_drm_create_bo *
 		return ERR_PTR(ret);
 	}
 	drm_gem_private_object_init(dev, gobj, aligned_sz);
-
 	abo->acct_total = false;
 	abo->acct_int = false;
 	return abo;
