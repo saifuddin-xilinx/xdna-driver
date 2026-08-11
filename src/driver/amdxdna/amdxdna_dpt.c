@@ -485,13 +485,19 @@ static int amdxdna_dpt_get_data(struct amdxdna_dpt *dpt, struct amdxdna_drm_get_
 	int ret = 0;
 	u32 offset;
 
-	buf_size = (size_t)args->num_element * args->element_size;
+	if (args->num_element != 1)
+		return -EINVAL;
+
+	buf_size = args->element_size;
 	buf = u64_to_user_ptr(args->buffer);
 	if (!access_ok(buf, buf_size)) {
 		XDNA_ERR(xdna, "Failed to access buffer, element num %d size 0x%x",
 			 args->num_element, args->element_size);
 		return -EFAULT;
 	}
+
+	if (buf_size < sizeof(footer))
+		return -ENOSPC;
 
 	offset = buf_size - sizeof(footer);
 	if (copy_from_user(&footer, buf + offset, sizeof(footer)))
