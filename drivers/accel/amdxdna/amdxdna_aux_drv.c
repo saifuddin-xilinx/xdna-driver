@@ -23,7 +23,7 @@
 #include "amdxdna_cbuf.h"
 #include "amdxdna_ctx.h"
 #include "amdxdna_debugfs.h"
-#include "amdxdna_pci_drv.h"
+#include "amdxdna_drv.h"
 
 static void amdxdna_aux_release(struct drm_device *drm, void *res)
 {

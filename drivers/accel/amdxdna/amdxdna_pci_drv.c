@@ -1,9 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
  * Copyright (C) 2022-2026, Advanced Micro Devices, Inc.
- *
- * PCI-bus attachment for AMD XDNA devices. The bus-agnostic DRM driver,
- * file operations, client open/close and shared ioctls live in amdxdna_drv.c.
  */
 
 #include "drm/amdxdna_accel.h"

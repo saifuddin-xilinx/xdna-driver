@@ -21,7 +21,7 @@
 #include "amdxdna_ctx.h"
 #include "amdxdna_gem.h"
 #include "amdxdna_mailbox.h"
-#include "amdxdna_pci_drv.h"
+#include "amdxdna_drv.h"
 #include "amdxdna_pm.h"
 
 static bool force_cmdlist = true;
@@ -135,7 +135,6 @@ static void aie2_job_release(struct kref *ref)
 		dma_fence_put(job->aie2_job_out_fence);
 	if (job->drv_cmd)
 		aie2_cmd_put(job->drv_cmd);
-	kfree(job->aie2_job_health);
 	kfree(job);
 }
 
@@ -295,11 +294,13 @@ aie2_sched_notify(struct amdxdna_sched_job *job)
 
 static void aie2_set_cmd_timeout(struct amdxdna_sched_job *job)
 {
+	struct app_health_report *report __free(kfree) = job->hwctx->priv->cached_health;
 	struct aie2_ctx_health *aie2_health __free(kfree) = NULL;
 	struct amdxdna_dev *xdna = job->hwctx->client->xdna;
 	struct amdxdna_gem_obj *cmd_abo = job->cmd_bo;
-	struct app_health_report *report = job->aie2_job_health;
 	u32 fail_cmd_idx = 0;
+
+	job->hwctx->priv->cached_health = NULL;
 
 	if (!report)
 		goto set_timeout;
@@ -527,14 +528,12 @@ aie2_sched_job_timedout(struct drm_sched_job *sched_job)
 	struct app_health_report *report;
 	struct amdxdna_dev_hdl *ndev;
 	struct amdxdna_dev *xdna;
-	struct aie_device *aie;
 	bool fw_dead = false;
 	bool fw_fatal = false;
 	int ret;
 
 	xdna = hwctx->client->xdna;
 	ndev = xdna->dev_handle;
-	aie = &ndev->aie;
 
 	guard(mutex)(&xdna->dev_lock);
 
@@ -559,13 +558,13 @@ aie2_sched_job_timedout(struct drm_sched_job *sched_job)
 			 */
 			if (report->fatal_info.fatal_type)
 				fw_fatal = true;
-			job->aie2_job_health = report;
+			hwctx->priv->cached_health = report;
 		}
 	}
 
 	if (xdna->auto_coredump) {
 		kvfree(hwctx->coredump);
-		hwctx->coredump = amdxdna_get_hwctx_coredump(aie, hwctx);
+		hwctx->coredump = amdxdna_get_hwctx_coredump(hwctx);
 		if (IS_ERR(hwctx->coredump)) {
 			XDNA_ERR(xdna, "Failed to get core dump on job timing out: %ld",
 				 PTR_ERR(hwctx->coredump));
@@ -985,6 +984,7 @@ void aie2_hwctx_fini(struct amdxdna_hwctx *hwctx)
 	amdxdna_gem_unpin(hwctx->priv->heap);
 	drm_gem_object_put(to_gobj(hwctx->priv->heap));
 
+	kfree(hwctx->priv->cached_health);
 	mutex_destroy(&hwctx->priv->io_lock);
 	aie2_hwctx_put_cu_bos(hwctx);
 	kfree(hwctx->col_list);

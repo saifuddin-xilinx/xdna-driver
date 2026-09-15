@@ -9,7 +9,7 @@
 #include <linux/kernel.h>
 
 #include "amdxdna_cma_buf.h"
-#include "amdxdna_pci_drv.h"
+#include "amdxdna_drv.h"
 
 /*
  * CMA backend. On platforms without IOMMU/SVA (e.g. arm64), the device cannot
@@ -109,10 +109,12 @@ static const struct dma_buf_ops amdxdna_cmabuf_dmabuf_ops = {
 	.vmap		= amdxdna_cmabuf_vmap,
 };
 
-static struct dma_buf *amdxdna_alloc_cma_buf_from_dev(struct device *ddev, size_t size)
+struct dma_buf *amdxdna_get_cma_buf(struct drm_device *dev, size_t size)
 {
+	struct amdxdna_dev *xdna = to_xdna_dev(dev);
 	DEFINE_DMA_BUF_EXPORT_INFO(exp_info);
 	struct amdxdna_cmabuf_priv *cmabuf;
+	struct device *ddev = dev->dev;
 	struct dma_buf *dbuf;
 	dma_addr_t dma_addr;
 	void *cpu_addr;
@@ -125,6 +127,7 @@ static struct dma_buf *amdxdna_alloc_cma_buf_from_dev(struct device *ddev, size_
 	size = PAGE_ALIGN(size);
 	cpu_addr = dma_alloc_coherent(ddev, size, &dma_addr, GFP_KERNEL);
 	if (!cpu_addr) {
+		XDNA_ERR(xdna, "Failed to alloc 0x%zx CMA bytes", size);
 		ret = -ENOMEM;
 		goto free_cmabuf;
 	}
@@ -154,17 +157,7 @@ free_cmabuf:
 	return ERR_PTR(ret);
 }
 
-struct dma_buf *amdxdna_get_cma_buf(struct drm_device *dev, size_t size)
-{
-	struct amdxdna_dev *xdna = to_xdna_dev(dev);
-	struct dma_buf *dbuf;
-
-	dbuf = amdxdna_alloc_cma_buf_from_dev(dev->dev, size);
-	if (IS_ERR(dbuf))
-		XDNA_ERR(xdna, "Failed to alloc 0x%zx CMA bytes", size);
-	return dbuf;
-}
-
+#if defined(AMDXDNA_AUX)
 /**
  * amdxdna_get_cma_buf_with_fallback - Allocate CMA buffer from a specific bank
  * with fallback to default CMA.
@@ -225,3 +218,4 @@ u32 amdxdna_mem_region_from_addr(const struct amdxdna_cma_region *regions,
 
 	return 0;
 }
+#endif

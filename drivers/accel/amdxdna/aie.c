@@ -18,7 +18,7 @@
 #include "amdxdna_gem.h"
 #include "amdxdna_mailbox_helper.h"
 #include "amdxdna_mailbox.h"
-#include "amdxdna_pci_drv.h"
+#include "amdxdna_drv.h"
 #include "amdxdna_pm.h"
 
 void aie_dump_mgmt_chann_debug(struct aie_device *aie)
@@ -140,6 +140,45 @@ void amdxdna_vbnv_init(struct amdxdna_dev *xdna)
 	amdxdna_update_vbnv(xdna, info->rev_vbnv_tbl, rev);
 }
 
+void amdxdna_io_stats_job_start(struct amdxdna_client *client)
+{
+	int depth;
+
+	guard(spinlock)(&client->io_stats.lock);
+
+	depth = client->io_stats.job_depth++;
+	if (!depth)
+		client->io_stats.start_time = ktime_get_ns();
+}
+
+void amdxdna_io_stats_job_done(struct amdxdna_client *client)
+{
+	u64 busy_ns;
+	int depth;
+
+	guard(spinlock)(&client->io_stats.lock);
+
+	depth = --client->io_stats.job_depth;
+	if (!depth) {
+		busy_ns = ktime_get_ns() - client->io_stats.start_time;
+		client->io_stats.start_time = 0;
+		client->io_stats.busy_time += busy_ns;
+	}
+}
+
+u64 amdxdna_io_stats_busy_time_ns(struct amdxdna_client *client)
+{
+	u64 busy_ns;
+
+	guard(spinlock)(&client->io_stats.lock);
+
+	busy_ns = client->io_stats.busy_time;
+	if (client->io_stats.job_depth)
+		busy_ns += ktime_get_ns() - client->io_stats.start_time;
+
+	return busy_ns;
+}
+
 int amdxdna_get_aie_version(struct amdxdna_client *client,
 			    struct amdxdna_drm_get_info *args,
 			    struct amdxdna_drm_query_aie_version *version)
@@ -168,10 +207,9 @@ int amdxdna_get_firmware_version(struct amdxdna_client *client,
 	return ret;
 }
 
-int amdxdna_get_metadata(struct aie_device *aie,
-			 struct amdxdna_client *client,
-			 struct amdxdna_drm_get_info *args)
+int amdxdna_get_metadata(struct amdxdna_client *client, struct amdxdna_drm_get_info *args)
 {
+	struct aie_device *aie = to_aie_dev(client->xdna);
 	int ret = 0;
 	u32 buf_sz;
 
@@ -182,12 +220,11 @@ int amdxdna_get_metadata(struct aie_device *aie,
 	return ret;
 }
 
-int amdxdna_get_aie_status(struct aie_device *aie,
-			   struct amdxdna_client *client,
-			   struct amdxdna_drm_get_info *args)
+int amdxdna_get_aie_status(struct amdxdna_client *client, struct amdxdna_drm_get_info *args)
 {
 	struct amdxdna_drm_query_aie_status status = {};
 	struct amdxdna_dev *xdna = client->xdna;
+	struct aie_device *aie = to_aie_dev(xdna);
 	struct amdxdna_msg_buf_hdl *buf_hdl;
 	u32 cols_filled = 0;
 	u32 resp_size = 0;
@@ -215,7 +252,7 @@ int amdxdna_get_aie_status(struct aie_device *aie,
 	memset(to_cpu_addr(buf_hdl, 0), 0, to_buf_size(buf_hdl));
 	drm_clflush_virt_range(to_cpu_addr(buf_hdl, 0), to_buf_size(buf_hdl));
 
-	ret = aie->msg_ops.query_status(aie, buf_hdl, &cols_filled, &resp_size);
+	ret = aie->msg_ops.query_status(buf_hdl, &cols_filled, &resp_size);
 	if (ret) {
 		XDNA_ERR(xdna, "Failed to get AIE status info, ret %d", ret);
 		goto out_free;
@@ -274,6 +311,7 @@ static int amdxdna_fill_hwctx_map_cb(struct amdxdna_hwctx *hwctx, void *arg)
 	ctx->map[hwctx->fw_ctx_id] = hwctx->id;
 	return 0;
 }
+
 /*
  * Fill the firmware-context-id to driver-context-id translation for every
  * context the caller may see. amdxdna_get_telemetry() places the result at
@@ -300,13 +338,12 @@ static int amdxdna_fill_hwctx_map(struct aie_device *aie, u32 *map)
 	return 0;
 }
 
-int amdxdna_get_telemetry(struct aie_device *aie,
-			  struct amdxdna_client *client,
-			  struct amdxdna_drm_get_info *args)
+int amdxdna_get_telemetry(struct amdxdna_client *client, struct amdxdna_drm_get_info *args)
 {
 	struct amdxdna_drm_query_telemetry_header *header __free(kfree) = NULL;
 	u32 telemetry_data_sz, header_sz, elem_num;
 	struct amdxdna_dev *xdna = client->xdna;
+	struct aie_device *aie = to_aie_dev(xdna);
 	u64 payload;
 	int ret;
 

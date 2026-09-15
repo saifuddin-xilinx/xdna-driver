@@ -2,9 +2,11 @@
 /*
  * Copyright (C) 2022-2026, Advanced Micro Devices, Inc.
  *
- * Bus-agnostic amdxdna core: the DRM driver definition, file operations,
- * client open/close and the shared ioctl handlers. Bus-specific attachment
- * lives in amdxdna_pci_drv.c (PCI) and amdxdna_aux_drv.c (auxiliary bus).
+ * Transport-independent DRM/accel layer for amdxdna: the drm_driver, its file
+ * operations and ioctls, per-client (drm_file) open/close, and the SVA (PASID)
+ * binding.  Shared by the PCI driver (amdxdna_pci_drv.c) and the platform
+ * driver (amdxdna_plat_drv.c); both hand the ioctls off to the per-device
+ * amdxdna_dev_ops.
  */
 
 #include "drm/amdxdna_accel.h"
@@ -17,12 +19,14 @@
 #include <drm/gpu_scheduler.h>
 #include <linux/delay.h>
 #include <linux/iommu.h>
+#include <linux/rcupdate.h>
+#include <linux/sched/mm.h>
 
 #include "aie.h"
 #include "amdxdna_cbuf.h"
 #include "amdxdna_ctx.h"
 #include "amdxdna_gem.h"
-#include "amdxdna_pci_drv.h"
+#include "amdxdna_drv.h"
 
 /*
  * 0.0: Initial version
@@ -56,7 +60,7 @@ static int amdxdna_sva_init(struct amdxdna_client *client)
 
 	client->sva = iommu_sva_bind_device(xdna->ddev.dev, client->mm);
 	if (IS_ERR(client->sva)) {
-		XDNA_DBG(xdna, "SVA bind device failed, ret %ld", PTR_ERR(client->sva));
+		XDNA_ERR(xdna, "SVA bind device failed, ret %ld", PTR_ERR(client->sva));
 		return PTR_ERR(client->sva);
 	}
 
@@ -100,6 +104,7 @@ static int amdxdna_drm_open(struct drm_device *ddev, struct drm_file *filp)
 
 	client->pid = pid_nr(rcu_access_pointer(filp->pid));
 	get_task_comm(client->name, current);
+	client->euid = current_euid();
 	client->xdna = xdna;
 	client->pasid = IOMMU_PASID_INVALID;
 	client->mm = current->mm;
@@ -108,20 +113,13 @@ static int amdxdna_drm_open(struct drm_device *ddev, struct drm_file *filp)
 	if (!amdxdna_iova_on(xdna)) {
 		/* No need to fail open since user may use pa + carveout later. */
 		if (amdxdna_sva_init(client)) {
-			XDNA_DBG(xdna, "PASID not available for pid %d", client->pid);
-#ifndef AMDXDNA_AUX
-			/*
-			 * PCI/NPU requires either PASID or a pre-configured
-			 * carveout. VE2 (aux) uses PA mode and may configure
-			 * carveout later, so open must not fail here.
-			 */
+			XDNA_WARN(xdna, "PASID not available for pid %d", client->pid);
 			if (!amdxdna_use_carveout(xdna)) {
 				XDNA_ERR(xdna, "PASID unavailable and carveout not configured");
 				cleanup_srcu_struct(&client->hwctx_srcu);
 				kfree(client);
 				return -EINVAL;
 			}
-#endif
 		}
 	}
 #endif
@@ -136,6 +134,9 @@ static int amdxdna_drm_open(struct drm_device *ddev, struct drm_file *filp)
 			    xdna->dev_info->dev_heap_max_size);
 	mutex_init(&client->mm_lock);
 	INIT_LIST_HEAD(&client->bo_invalid_list);
+	filp->driver_priv = client;
+	client->filp = filp;
+	spin_lock_init(&client->io_stats.lock);
 
 	mutex_lock(&xdna->client_lock);
 	mutex_lock(&xdna->dev_lock);
@@ -143,16 +144,11 @@ static int amdxdna_drm_open(struct drm_device *ddev, struct drm_file *filp)
 	mutex_unlock(&xdna->dev_lock);
 	mutex_unlock(&xdna->client_lock);
 
-	filp->driver_priv = client;
-	client->filp = filp;
-
-	spin_lock_init(&client->io_stats.lock);
-
 	XDNA_DBG(xdna, "pid %d opened", client->pid);
 	return 0;
 }
 
-void amdxdna_client_cleanup(struct amdxdna_client *client)
+static void amdxdna_client_cleanup(struct amdxdna_client *client)
 {
 	struct amdxdna_gem_obj *abo, *tmp, *heap;
 	struct amdxdna_dev *xdna = client->xdna;
@@ -292,50 +288,11 @@ static const struct drm_ioctl_desc amdxdna_drm_ioctls[] = {
 	DRM_IOCTL_DEF_DRV(AMDXDNA_SET_STATE, amdxdna_drm_set_state_ioctl, DRM_ROOT_ONLY),
 };
 
-void amdxdna_io_stats_job_start(struct amdxdna_client *client)
-{
-	int depth;
-
-	guard(spinlock)(&client->io_stats.lock);
-
-	depth = client->io_stats.job_depth++;
-	if (!depth)
-		client->io_stats.start_time = ktime_get_ns();
-}
-
-void amdxdna_io_stats_job_done(struct amdxdna_client *client)
-{
-	u64 busy_ns;
-	int depth;
-
-	guard(spinlock)(&client->io_stats.lock);
-
-	depth = --client->io_stats.job_depth;
-	if (!depth) {
-		busy_ns = ktime_get_ns() - client->io_stats.start_time;
-		client->io_stats.start_time = 0;
-		client->io_stats.busy_time += busy_ns;
-	}
-}
-
-u64 amdxdna_io_stats_busy_time_ns(struct amdxdna_client *client)
-{
-	u64 busy_ns;
-
-	guard(spinlock)(&client->io_stats.lock);
-
-	busy_ns = client->io_stats.busy_time;
-	if (client->io_stats.job_depth)
-		busy_ns += ktime_get_ns() - client->io_stats.start_time;
-
-	return busy_ns;
-}
-
 static void amdxdna_show_fdinfo(struct drm_printer *p, struct drm_file *filp)
 {
 	struct amdxdna_client *client = filp->driver_priv;
 	size_t heap_usage, external_usage, internal_usage;
-	char *drv_name = filp->minor->dev->driver->name;
+	const char *drv_name = filp->minor->dev->driver->name;
 
 	drm_printf(p, "drm-engine-%s:\t%llu ns\n",
 		   drv_name, amdxdna_io_stats_busy_time_ns(client));

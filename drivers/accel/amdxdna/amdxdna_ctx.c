@@ -16,18 +16,9 @@
 
 #include "amdxdna_ctx.h"
 #include "amdxdna_gem.h"
-#include "amdxdna_pci_drv.h"
+#include "amdxdna_drv.h"
 #include "amdxdna_pm.h"
 
-/*
- * Upper bound of the device-wide hwctx ID space. Kept at U32_MAX (matching the
- * legacy VE2 driver's XA_LIMIT(1, U32_MAX)) so the cyclic allocator does not
- * wrap back onto still-live IDs after only a small number of create/destroy
- * cycles. A smaller ceiling (e.g. 1024) makes ida_alloc_range() return -ENOSPC
- * once that many IDs have been consumed cyclically, spuriously failing hwctx
- * creation.
- */
-#define MAX_DRIVER_HWCTX_ID	U32_MAX
 static void amdxdna_hwctx_release_expanded_heap(struct amdxdna_hwctx *hwctx)
 {
 	struct amdxdna_client *client = hwctx->client;
@@ -215,12 +206,12 @@ static int amdxdna_hwctx_id_alloc(struct amdxdna_dev *xdna)
 		xdna->next_hwctxid = AMDXDNA_MIN_HWCTX_ID;
 
 	id = ida_alloc_range(&xdna->hwctx_ida, xdna->next_hwctxid,
-			     MAX_DRIVER_HWCTX_ID, GFP_KERNEL);
+			     MAX_HWCTX_ID, GFP_KERNEL);
 	if (id == -ENOSPC)
 		id = ida_alloc_range(&xdna->hwctx_ida, AMDXDNA_MIN_HWCTX_ID,
-				     MAX_DRIVER_HWCTX_ID, GFP_KERNEL);
+				     MAX_HWCTX_ID, GFP_KERNEL);
 	if (id >= 0)
-		xdna->next_hwctxid = (id >= MAX_DRIVER_HWCTX_ID) ?
+		xdna->next_hwctxid = (id >= MAX_HWCTX_ID) ?
 			AMDXDNA_MIN_HWCTX_ID : id + 1;
 
 	return id;
@@ -312,21 +303,6 @@ int amdxdna_drm_create_hwctx_ioctl(struct drm_device *dev, void *data, struct dr
 		goto free_hwctx;
 	}
 
-	/*
-	 * Allocate the hwctx ID before hwctx_init() (rather than after, as
-	 * upstream drm/xe and amdgpu ctx ioctls typically do) so that
-	 * hwctx->id is valid for the whole lifetime of hwctx_init(), matching
-	 * the legacy VE2 driver's ctx_init() ordering. This lets per-backend
-	 * hwctx_init() implementations (and their trace points) identify the
-	 * hwctx being created instead of seeing an unset ID.
-	 */
-	ret = amdxdna_hwctx_id_alloc(xdna);
-	if (ret < 0) {
-		XDNA_ERR(xdna, "Allocate hwctx ID failed, ret %d", ret);
-		goto exit_dev;
-	}
-	hwctx->id = ret;
-
 	ret = xdna->dev_info->ops->hwctx_init(hwctx);
 	if (ret) {
 		XDNA_ERR(xdna, "Init hwctx failed, ret %d", ret);
@@ -339,6 +315,13 @@ int amdxdna_drm_create_hwctx_ioctl(struct drm_device *dev, void *data, struct dr
 		goto fini_hwctx;
 	}
 
+	ret = amdxdna_hwctx_id_alloc(xdna);
+	if (ret < 0) {
+		XDNA_ERR(xdna, "Allocate hwctx ID failed, ret %d", ret);
+		goto free_name;
+	}
+	hwctx->id = ret;
+
 	atomic64_set(&hwctx->job_submit_cnt, 0);
 	atomic64_set(&hwctx->job_free_cnt, 0);
 	init_waitqueue_head(&hwctx->job_free_wq);
@@ -347,7 +330,7 @@ int amdxdna_drm_create_hwctx_ioctl(struct drm_device *dev, void *data, struct dr
 	ret = xa_err(xa_store(&client->hwctx_xa, hwctx->id, hwctx, GFP_KERNEL));
 	if (ret) {
 		XDNA_ERR(xdna, "Store hwctx %d failed, ret %d", hwctx->id, ret);
-		goto free_name;
+		goto free_id;
 	}
 
 	args->handle = hwctx->id;
@@ -357,14 +340,14 @@ int amdxdna_drm_create_hwctx_ioctl(struct drm_device *dev, void *data, struct dr
 	drm_dev_exit(idx);
 	return 0;
 
+free_id:
+	ida_free(&xdna->hwctx_ida, hwctx->id);
 free_name:
 	kfree(hwctx->name);
 fini_hwctx:
 	xdna->dev_info->ops->hwctx_fini(hwctx);
 release_expanded_heap:
 	amdxdna_hwctx_release_expanded_heap(hwctx);
-	ida_free(&xdna->hwctx_ida, hwctx->id);
-exit_dev:
 	drm_dev_exit(idx);
 free_hwctx:
 	kfree(hwctx);

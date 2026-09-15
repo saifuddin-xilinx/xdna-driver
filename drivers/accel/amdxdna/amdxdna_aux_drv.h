@@ -7,7 +7,7 @@
 #define _AMDXDNA_AUX_DRV_H_
 
 #include "drm/amdxdna_accel.h"
-#include "amdxdna_pci_drv.h"
+#include "amdxdna_drv.h"
 
 extern const struct amdxdna_dev_info dev_ve2_info;
 
