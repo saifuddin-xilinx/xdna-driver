@@ -144,6 +144,7 @@ enum amdxdna_drm_config_hwctx_param {
 	DRM_AMDXDNA_HWCTX_CONFIG_CU,
 	DRM_AMDXDNA_HWCTX_ASSIGN_DBG_BUF,
 	DRM_AMDXDNA_HWCTX_REMOVE_DBG_BUF,
+	DRM_AMDXDNA_HWCTX_CONFIG_OPCODE_TIMEOUT,
 };
 
 /**
@@ -272,7 +273,11 @@ struct amdxdna_drm_create_bo {
  * @ext: MBZ.
  * @ext_flags: MBZ.
  * @handle: DRM buffer object handle.
- * @pad: MBZ.
+ * @mem_region: MBZ on input. Returned index of the memory region backing the
+ *		buffer. The index is device local and uses the same numbering as
+ *		the DRM_AMDXDNA_HWCTX_MEM_BITMAP bit positions. 0 is also
+ *		returned when the buffer matches no declared region and on
+ *		devices that do not partition device memory into regions.
  * @map_offset: Returned DRM fake offset for mmap().
  * @vaddr: Returned user VA of buffer. 0 in case user needs mmap().
  * @xdna_addr: Returned XDNA device virtual address.
@@ -281,7 +286,7 @@ struct amdxdna_drm_get_bo_info {
 	__u64 ext;
 	__u64 ext_flags;
 	__u32 handle;
-	__u32 pad;
+	__u32 mem_region;
 	__u64 map_offset;
 	__u64 vaddr;
 	__u64 xdna_addr;
@@ -875,6 +880,8 @@ struct amdxdna_drm_get_dpt_state {
 #define DRM_AMDXDNA_FW_LOG_CONFIG	7
 #define DRM_AMDXDNA_FW_TRACE_CONFIG	8
 #define DRM_AMDXDNA_AIE_TILE_READ	9
+#define DRM_AMDXDNA_HWCTX_AIE_PART_FD	10
+#define DRM_AMDXDNA_HWCTX_MEM_BITMAP	11
 
 /**
  * struct amdxdna_drm_get_array - Get information array.
@@ -1038,6 +1045,7 @@ enum amdxdna_drm_set_param {
 	DRM_AMDXDNA_SET_FW_LOG_STATE,
 	DRM_AMDXDNA_SET_FW_TRACE_STATE,
 	DRM_AMDXDNA_AIE_TILE_WRITE,
+	DRM_AMDXDNA_SET_CLOCK_FREQ,
 	DRM_AMDXDNA_SET_AUTO_COREDUMP = 9,
 };
 
