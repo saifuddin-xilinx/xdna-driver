@@ -62,16 +62,20 @@ enum amdxdna_drm_ioctl_id {
  * @latency: Frame response latency.
  * @frame_exec_time: Frame execution time.
  * @priority: Request priority.
+ * @user_start_col: User-requested AIE partition start column (VE2).
+ * @reserved: MBZ; ensures 64-bit alignment.
  *
  * User program can provide QoS hints to driver.
  */
 struct amdxdna_qos_info {
-	__u32 gops;
-	__u32 fps;
-	__u32 dma_bandwidth;
-	__u32 latency;
-	__u32 frame_exec_time;
-	__u32 priority;
+        __u32 gops;
+        __u32 fps;
+        __u32 dma_bandwidth;
+        __u32 latency;
+        __u32 frame_exec_time;
+        __u32 priority;
+        __u32 user_start_col;
+        __u32 reserved; /* ensure 64-bit alignment */
 };
 
 /**
