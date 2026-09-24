@@ -155,7 +155,7 @@ static int amdxdna_drm_open(struct drm_device *ddev, struct drm_file *filp)
 	return 0;
 }
 
-static void amdxdna_client_cleanup(struct amdxdna_client *client)
+void amdxdna_client_cleanup(struct amdxdna_client *client)
 {
 	struct amdxdna_gem_obj *abo, *tmp, *heap;
 	struct amdxdna_dev *xdna = client->xdna;
