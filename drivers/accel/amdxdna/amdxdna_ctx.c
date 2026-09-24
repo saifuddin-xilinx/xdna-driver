@@ -21,6 +21,15 @@
 #include "amdxdna_drv.h"
 #include "amdxdna_pm.h"
 
+/*
+ * Upper bound of the device-wide hwctx ID space. Kept at U32_MAX (matching the
+ * legacy VE2 driver's XA_LIMIT(1, U32_MAX)) so the cyclic allocator does not
+ * wrap back onto still-live IDs after only a small number of create/destroy
+ * cycles. A smaller ceiling (e.g. 1024) makes ida_alloc_range() return -ENOSPC
+ * once that many IDs have been consumed cyclically, spuriously failing hwctx
+ * creation.
+ */
+#define MAX_DRIVER_HWCTX_ID	U32_MAX
 static void amdxdna_hwctx_release_expanded_heap(struct amdxdna_hwctx *hwctx)
 {
 	struct amdxdna_client *client = hwctx->client;
@@ -406,8 +415,15 @@ int amdxdna_drm_config_hwctx_ioctl(struct drm_device *dev, void *data, struct dr
 	int ret;
 	u64 val;
 
+#ifndef AMDXDNA_AUX
+	/*
+	 * VE2 (aux) user space (XRT) does not zero @pad on this ioctl, so the
+	 * MBZ enforcement is limited to the PCI/NPU path where user space
+	 * complies with the ABI.
+	 */
 	if (XDNA_MBZ_DBG(xdna, &args->pad, sizeof(args->pad)))
 		return -EINVAL;
+#endif
 
 	if (!xdna->dev_info->ops->hwctx_config)
 		return -EOPNOTSUPP;
@@ -436,6 +452,7 @@ int amdxdna_drm_config_hwctx_ioctl(struct drm_device *dev, void *data, struct dr
 		break;
 	case DRM_AMDXDNA_HWCTX_ASSIGN_DBG_BUF:
 	case DRM_AMDXDNA_HWCTX_REMOVE_DBG_BUF:
+	case DRM_AMDXDNA_HWCTX_CONFIG_OPCODE_TIMEOUT:
 		/* For those types that param_val is a value */
 		buf = NULL;
 		buf_size = 0;
