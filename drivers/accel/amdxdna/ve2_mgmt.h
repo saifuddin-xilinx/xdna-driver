@@ -35,19 +35,45 @@ struct amdxdna_hwctx;
 /* Size of one AIE tile's address space used for coredump reads. */
 #define TILE_ADDRESS_SPACE		0x100000
 
-struct ve2_ctx_fifo_entry {
-	struct amdxdna_hwctx		*ctx;
-	u64				command_index;
+/* Job entry - inspired by drm_sched_job */
+struct ve2_job {
 	struct list_head		list;
+	struct amdxdna_hwctx		*hwctx;
+	u64				seq;
+};
+
+/* Per-partition scheduler - DRM-inspired design */
+struct ve2_scheduler {
+	/* Job queue */
+	struct list_head		job_queue;       /* Pending jobs */
+	spinlock_t			job_lock;        /* Protects job_queue */
+
+	/* active_ctx lives in mgmtctx, the single source of truth. */
+	bool				ctx_switch_requested;
+
+	/* Workqueue */
+	struct workqueue_struct		*wq;
+	struct work_struct		sched_work;
+
+	/* Back-pointer */
+	struct amdxdna_mgmtctx		*mgmtctx;
+
+	/* Statistics */
+	atomic64_t			total_jobs;
+	atomic64_t			total_switches;
 };
 
 struct amdxdna_mgmtctx {
 	struct device			*aie_dev;
 	struct amdxdna_hwctx		*active_ctx;
-	struct list_head		ctx_command_fifo_head;
-	struct workqueue_struct		*work_queue;
-	struct work_struct		scheduler_work;
-	struct mutex			ctx_lock;/* protects active_ctx, scheduler, fifo */
+	/*
+	 * Set when CERT never confirmed yielding a destroyed context. Until
+	 * cleared by the next real AIE partition (re)request, the scheduler
+	 * must not fast-start a new context without an idle check, and
+	 * nothing may free that context's DMA-visible buffers.
+	 */
+	bool				wedged;
+	struct mutex			ctx_lock;/* protects active_ctx and partition lifecycle */
 	u32				start_col;
 	u32				num_col;
 	u32				num_rows;
@@ -56,9 +82,9 @@ struct amdxdna_mgmtctx {
 	struct amdxdna_async_err_cache	async_errs_cache;/* cache for last async error */
 	struct completion		error_cb_completion;/* signalled when error cb finishes */
 	atomic_t			error_cb_in_progress;/* set while error cb is running */
-	u32				is_partition_idle;/* fw idle, ready to switch */
-	u32				is_context_req;/* ctx_switch_req asserted to fw */
-	u32				is_idle_due_to_context;/* fw acked the switch req */
+
+	/* DRM-inspired scheduler */
+	struct ve2_scheduler		scheduler;
 };
 
 extern int enable_debug_queue;
@@ -136,8 +162,16 @@ int ve2_mgmtctx_registry_init(struct amdxdna_dev_hdl *hdl);
 /* Request XRS resources and create the AIE management partition for @hwctx. */
 int ve2_xrs_request(struct amdxdna_dev *xdna, struct amdxdna_hwctx *hwctx);
 
-/* Tear down the AIE management partition and release XRS resources. */
+/*
+ * Tear down the AIE management partition and release XRS resources.
+ * Returns -EBUSY if CERT never confirmed yielding hwctx on a partition still
+ * shared by another context - the caller must not free hwctx's DMA-visible
+ * buffers (HSA queue) in that case, since CERT may still be using them.
+ */
 int ve2_mgmt_destroy_partition(struct amdxdna_hwctx *hwctx);
+
+/* Drain @hwctx's queued/in-flight scheduler work before freeing its buffers. */
+void ve2_mgmt_quiesce_ctx(struct amdxdna_hwctx *hwctx);
 
 /* Schedule a command on the host queue commit path. */
 int ve2_mgmt_schedule_cmd(struct amdxdna_dev *xdna, struct amdxdna_hwctx *hwctx,
