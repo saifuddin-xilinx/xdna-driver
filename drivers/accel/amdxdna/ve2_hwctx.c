@@ -1179,30 +1179,23 @@ void ve2_hwctx_fini(struct amdxdna_hwctx *hwctx)
 	if (vp && vp->mgmtctx)
 		ve2_get_firmware_status(hwctx);
 
-	/*
-	 * Quiesce the scheduler before freeing the handshake buffer: a
-	 * concurrently running scheduler pass can still be using it via
-	 * ve2_mgmt_handshake_init(). Free it before tearing the partition
-	 * down, while aie_dev is still valid.
-	 */
+	/* Drain scheduler work before destroying the partition or its buffers. */
 	ve2_mgmt_quiesce_ctx(hwctx);
-	if (vp && vp->hs_buf_va && vp->mgmtctx && vp->mgmtctx->aie_dev) {
-		dma_free_coherent(vp->mgmtctx->aie_dev, vp->hs_buf_size,
-				  vp->hs_buf_va, vp->hs_buf_dma);
-		vp->hs_buf_va = NULL;
-		vp->hs_buf_size = 0;
-	}
 
 	if (enable_polling && vp)
 		timer_delete_sync(&vp->event_timer);
 	ve2_mgmt_destroy_partition(hwctx);
 	if (vp)
 		cancel_work_sync(&vp->completion_work);
-	ve2_free_hsa_queue(hwctx);
+	if (vp && vp->retain_dma_resources)
+		ve2_drain_pending(hwctx);
+	else
+		ve2_free_hsa_queue(hwctx);
 
 	if (enable_debug_queue && vp && vp->dbg_queue.dbg_queue_p) {
 		timer_delete_sync(&vp->dbg_q_timer);
-		ve2_free_dbg_queue(hwctx);
+		if (!vp->retain_dma_resources)
+			ve2_free_dbg_queue(hwctx);
 	}
 
 	if (vp) {

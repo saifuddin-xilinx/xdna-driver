@@ -80,6 +80,7 @@ struct amdxdna_ctx_priv {
 	u32				mem_bitmap;
 	u32				partition_id;
 	bool				misc_intrpt_flag;
+	bool				retain_dma_resources;
 	/*
 	 * Firmware misc_status as read when misc_intrpt_flag was first set for
 	 * this context. Reported by ve2_cmd_submit() on a poisoned context.
