@@ -453,8 +453,8 @@ release_hs_data:
 
 /*
  * Ask the firmware to save the currently-running context and yield the
- * partition. The CERT acknowledges by going idle, which the scheduler/IRQ
- * path detects to bring in the next context.
+ * partition. The scheduler reprograms the handshake once CERT confirms the
+ * switch through its IRQ path.
  */
 #define RR_SHARING BIT(0)
 static int ve2_request_context_switch(struct amdxdna_mgmtctx *mgmtctx)
@@ -759,6 +759,10 @@ static void ve2_sched_work_drm(struct work_struct *work)
 
 	/* Serialize against ve2_mgmt_destroy_partition() clearing active_ctx. */
 	mutex_lock(&mgmtctx->ctx_lock);
+	if (sched->blocked) {
+		mutex_unlock(&mgmtctx->ctx_lock);
+		return;
+	}
 	if (ve2_check_misc_interrupt(mgmtctx)) {
 		ve2_sched_timeout_pending_jobs(mgmtctx->active_ctx);
 		mutex_unlock(&mgmtctx->ctx_lock);
@@ -834,6 +838,7 @@ static int ve2_scheduler_init(struct amdxdna_mgmtctx *mgmtctx)
 	spin_lock_init(&sched->job_lock);
 
 	sched->ctx_switch_requested = false;
+	sched->blocked = false;
 	sched->mgmtctx = mgmtctx;
 
 	atomic64_set(&sched->total_jobs, 0);
@@ -1032,7 +1037,8 @@ static void ve2_irq_handler(u32 partition_id, void *priv)
 	} else if (boundary) {
 		/* Reaping confirmed jobs surfaced a different-context head job */
 		queue_work(sched->wq, &sched->sched_work);
-	} else if (sched->ctx_switch_requested && (cert_status.is_idle || cert_status.queue_not_empty)) {
+	} else if (sched->ctx_switch_requested &&
+		   (cert_status.is_idle || cert_status.queue_not_empty)) {
 		/* CERT responded to our context switch request */
 		queue_work(sched->wq, &sched->sched_work);
 	}
@@ -1521,7 +1527,7 @@ static bool ve2_mgmt_quiesce_active_ctx(struct amdxdna_mgmtctx *mgmtctx,
 		return true;
 	}
 	ve2_read_cert_status(mgmtctx, &status);
-	if (!status.is_idle && !status.queue_not_empty) {
+	if (!status.is_idle && !mgmtctx->scheduler.ctx_switch_requested) {
 		ve2_request_context_switch(mgmtctx);
 		mgmtctx->scheduler.ctx_switch_requested = true;
 		notify_fw_cmd_ready(mgmtctx);
@@ -1531,7 +1537,7 @@ static bool ve2_mgmt_quiesce_active_ctx(struct amdxdna_mgmtctx *mgmtctx,
 	deadline = jiffies + msecs_to_jiffies(VE2_QUIESCE_TIMEOUT_MS);
 	while (time_before(jiffies, deadline)) {
 		ve2_read_cert_status(mgmtctx, &status);
-		if (status.is_idle || status.queue_not_empty)
+		if (status.is_idle)
 			return true;
 		schedule_timeout_uninterruptible(msecs_to_jiffies(1));
 	}
@@ -1545,9 +1551,15 @@ int ve2_mgmt_destroy_partition(struct amdxdna_hwctx *hwctx)
 {
 	struct amdxdna_ctx_priv *vp = hwctx ? ve2_hw_priv(hwctx) : NULL;
 	bool release_aie_part = false;
+	bool safe_to_free_dma;
+	bool release_aie_dev = false;
 	struct amdxdna_mgmtctx *mgmtctx;
 	struct solver_state *xrs;
 	bool quiesced;
+	bool hwctx_was_active;
+	bool still_active;
+	bool scheduler_blocked;
+	int ret;
 
 	mgmtctx = vp ? vp->mgmtctx : NULL;
 	if (!mgmtctx) {
@@ -1565,19 +1577,40 @@ int ve2_mgmt_destroy_partition(struct amdxdna_hwctx *hwctx)
 
 	xrs = hwctx->client->xdna->xrs_hdl;
 
-	/* Remove queued jobs before clearing active_ctx, or a scheduler pass can
-	 * republish active_ctx to this (about to be freed) hwctx in between.
+	/*
+	 * Block scheduling before removing jobs or quiescing the context. A
+	 * scheduler pass already in flight is drained by the removal work below.
 	 */
+	mutex_lock(&mgmtctx->ctx_lock);
+	scheduler_blocked = mgmtctx->scheduler.blocked;
+	hwctx_was_active = mgmtctx->active_ctx == hwctx;
+	mgmtctx->scheduler.blocked = true;
+	mutex_unlock(&mgmtctx->ctx_lock);
+
 	ve2_sched_remove_ctx_jobs_sync(&mgmtctx->scheduler, hwctx);
 
-	quiesced = ve2_mgmt_quiesce_active_ctx(mgmtctx, hwctx);
-
 	mutex_lock(&mgmtctx->ctx_lock);
-	if (mgmtctx->active_ctx == hwctx) {
+	still_active = mgmtctx->active_ctx == hwctx;
+	mutex_unlock(&mgmtctx->ctx_lock);
+	if (hwctx_was_active && !still_active)
+		quiesced = false;
+	else
+		quiesced = ve2_mgmt_quiesce_active_ctx(mgmtctx, hwctx);
+	safe_to_free_dma = quiesced;
+
+	if (!quiesced) {
+		mutex_lock(&mgmtctx->ctx_lock);
 		mgmtctx->active_ctx = NULL;
 		mgmtctx->scheduler.ctx_switch_requested = false;
+		mutex_unlock(&mgmtctx->ctx_lock);
+	} else {
+		mutex_lock(&mgmtctx->ctx_lock);
+		if (mgmtctx->active_ctx == hwctx) {
+			mgmtctx->active_ctx = NULL;
+			mgmtctx->scheduler.ctx_switch_requested = false;
+		}
+		mutex_unlock(&mgmtctx->ctx_lock);
 	}
-	mutex_unlock(&mgmtctx->ctx_lock);
 
 	/* Release the XRS reservation; learn whether we were the last sharer. */
 	if (xrs) {
@@ -1587,7 +1620,8 @@ int ve2_mgmt_destroy_partition(struct amdxdna_hwctx *hwctx)
 	}
 
 	if (release_aie_part) {
-		ve2_clear_partition_handshake(mgmtctx, hwctx);
+		if (quiesced && !scheduler_blocked)
+			ve2_clear_partition_handshake(mgmtctx, hwctx);
 
 		ve2_aie_unregister_error_cb(mgmtctx->aie_dev);
 
@@ -1603,19 +1637,58 @@ int ve2_mgmt_destroy_partition(struct amdxdna_hwctx *hwctx)
 		 */
 		ve2_scheduler_fini(mgmtctx);
 
-		ve2_aie_partition_teardown(mgmtctx->aie_dev);
-		ve2_aie_partition_release(mgmtctx->aie_dev);
-		mgmtctx->aie_dev = NULL;
+		ret = ve2_aie_partition_teardown(mgmtctx->aie_dev);
+		if (ret < 0) {
+			XDNA_ERR(mgmtctx->xdna, "aie partition teardown failed, ret: %d", ret);
+			safe_to_free_dma = quiesced;
+		} else {
+			safe_to_free_dma = true;
+		}
+		release_aie_dev = true;
 	} else if (quiesced) {
-		/* Partition still shared; re-arm scheduler for other contexts' queued jobs. */
-		queue_work(mgmtctx->scheduler.wq, &mgmtctx->scheduler.sched_work);
+		if (!scheduler_blocked) {
+			/* Partition still shared; re-arm queued jobs. */
+			mutex_lock(&mgmtctx->ctx_lock);
+			mgmtctx->scheduler.blocked = false;
+			mutex_unlock(&mgmtctx->ctx_lock);
+			queue_work(mgmtctx->scheduler.wq,
+				   &mgmtctx->scheduler.sched_work);
+		}
+	} else {
+		/* Stop/reset CERT before allowing the context's DMA buffers to be freed. */
+		ret = ve2_aie_partition_teardown(mgmtctx->aie_dev);
+		if (ret < 0) {
+			XDNA_ERR(mgmtctx->xdna, "aie partition teardown failed, ret: %d", ret);
+			vp->retain_dma_resources = true;
+		} else {
+			safe_to_free_dma = true;
+			if (!scheduler_blocked) {
+				mutex_lock(&mgmtctx->ctx_lock);
+				mgmtctx->scheduler.blocked = false;
+				mutex_unlock(&mgmtctx->ctx_lock);
+				queue_work(mgmtctx->scheduler.wq,
+					   &mgmtctx->scheduler.sched_work);
+			}
+		}
 	}
 	/*
-	 * Else: CERT never confirmed yielding hwctx. Leave the scheduler
-	 * un-armed rather than risk Case 1 reprogramming the handshake while
-	 * CERT may still be executing it; other queued contexts stay pending
-	 * until an unrelated IRQ or submission re-triggers the scheduler.
+	 * On teardown failure, leave the scheduler blocked and retain the
+	 * possibly DMA-accessible buffers rather than rearming Case 1.
 	 */
+
+	if (safe_to_free_dma && vp->hs_buf_va) {
+		dma_free_coherent(mgmtctx->aie_dev, vp->hs_buf_size,
+				  vp->hs_buf_va, vp->hs_buf_dma);
+		vp->hs_buf_va = NULL;
+		vp->hs_buf_size = 0;
+	}
+	if (!safe_to_free_dma)
+		vp->retain_dma_resources = true;
+
+	if (release_aie_dev) {
+		ve2_aie_partition_release(mgmtctx->aie_dev);
+		mgmtctx->aie_dev = NULL;
+	}
 
 	vp->mgmtctx = NULL;
 

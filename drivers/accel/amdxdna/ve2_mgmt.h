@@ -50,6 +50,7 @@ struct ve2_scheduler {
 
 	/* active_ctx lives in mgmtctx, the single source of truth. */
 	bool				ctx_switch_requested;
+	bool				blocked;
 
 	/* Workqueue */
 	struct workqueue_struct		*wq;
